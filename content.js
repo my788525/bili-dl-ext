@@ -856,6 +856,11 @@
         .bili-dl-extra .extra-chk { display:inline-flex; align-items:center; gap:3px; font-size:12px; cursor:pointer; color:#4a6b52; }
         .bili-dl-conflict { display:flex; align-items:center; gap:6px; width:100%; font-size:12px; color:#666; margin-top:2px; }
         .bili-dl-conflict select { flex:1; padding:3px 4px; border:1px solid #eee; border-radius:6px; font-size:12px; }
+        /* 静默下载目录：更改按钮 + 当前目录名 */
+        .bili-dl-changedir { width:100%; margin-top:6px; padding:5px 8px; font-size:12px; cursor:pointer; border:1px solid #bcd9c4; border-radius:7px; background:#eaf6ee; color:#2e7d4f; text-align:center; }
+        .bili-dl-changedir:hover { background:#dcefe2; }
+        .bili-dl-dir-label { width:100%; margin-top:3px; font-size:11px; color:#7a8a80; word-break:break-all; }
+        .bili-dl-dir-label b { color:#2e7d4f; }
         /* 已下载分P：去重后预标记 */
         .bili-dl-row.is-done { background:#f0fff5; border-color:#9be3b0; }
         .bili-dl-row.is-done .mark { color:#2ecc71; }
@@ -919,6 +924,8 @@
               <label class="extra-chk"><input type="checkbox" id="bili-dl-aux-dm"> 弹幕</label>
               <label class="extra-chk"><input type="checkbox" id="bili-dl-aux-cover"> 封面</label>
               <label class="extra-chk" style="width:100%"><input type="checkbox" id="bili-dl-silent" checked> 静默下载（推荐·不走浏览器下载栏，直接写目录）</label>
+              <button type="button" id="bili-dl-change-dir" class="bili-dl-changedir">📁 更改下载目录</button>
+              <div id="bili-dl-dir-label" class="bili-dl-dir-label">未选择目录（首次下载会弹出选择）</div>
               <div class="bili-dl-conflict">
                 <span>并发下载</span>
                 <select id="bili-dl-conc">
@@ -1010,6 +1017,43 @@
     });
     silentCb.onchange = saveSilent;
     concSel.onchange = saveSilent;
+
+    // 静默下载目录：更改按钮 + 当前目录名显示
+    // 关键：fsDirHandle 在每次 content 重新注入时内存为空，需从 IndexedDB 恢复目录名显示；
+    // 「更改目录」必须在用户手势（click）内调用 showDirectoryPicker，并同步清空内存缓存 + 重写 IndexedDB。
+    const changeDirBtn = document.getElementById('bili-dl-change-dir');
+    const dirLabel = document.getElementById('bili-dl-dir-label');
+    function refreshDirLabel() {
+      if (fsDirHandle && fsDirHandle.name) {
+        dirLabel.innerHTML = '当前目录：<b>' + String(fsDirHandle.name).replace(/</g, '&lt;') + '</b>';
+      } else {
+        dirLabel.textContent = '未选择目录（首次下载会弹出选择）';
+      }
+    }
+    changeDirBtn.onclick = async () => {
+      if (!window.showDirectoryPicker) {
+        setStatus('⚠️ 当前浏览器不支持「文件系统访问 API」（如 Firefox），无法选目录。请关闭「静默下载」改走浏览器下载栏。');
+        return;
+      }
+      try {
+        const h = await window.showDirectoryPicker({ mode: 'readwrite' });
+        fsDirHandle = h; // 清空旧句柄，确保后续落盘用新目录
+        await idbSet('dirHandle', h).catch(() => {});
+        refreshDirLabel();
+        setStatus('✅ 下载目录已更改为：' + h.name);
+      } catch (e) {
+        if (e && e.name === 'AbortError') return; // 用户在弹窗里点了「取消」→ 不动声色
+        setStatus('⚠️ 选择目录失败：' + (e && e.message ? e.message : e));
+      }
+    };
+    // 面板打开时异步从 IndexedDB 恢复已保存的目录名（不触发权限弹窗）
+    (async () => {
+      try {
+        const stored = await idbGet('dirHandle').catch(() => null);
+        if (stored && stored.name) { fsDirHandle = stored; refreshDirLabel(); }
+        else refreshDirLabel();
+      } catch (_) { refreshDirLabel(); }
+    })();
 
     // 设置栏（统一收纳：仅下载音频 / 文件名格式 / 下载位置 / 测试 ffmpeg）：默认折叠，展开状态持久化
     const SETTINGS_OPEN_KEY = 'bili_dl_settings_open';

@@ -1,6 +1,6 @@
 {
-  "version": "1.1.2",
+  "version": "1.1.3",
   "release_url": "https://github.com/my788525/bili-dl-ext/releases/latest",
   "min_chrome": "110",
-  "notes": "修复静默下载「下载中 N/N 全部 ❌ 但文件没保存」三大问题：(1) offscreen 端把 8MB 分块改为火与忘（fire-and-forget）发送，不再 await SW 回执导致的 1 分钟超时死锁；(2) content 端落盘前显式调用 queryPermission/requestPermission，SW 重载或策略变化导致的权限失效会被重新激活；(3) 写盘失败（静默与下载 API 全部失败）会通过 setStatus/batchFail/Toast 显式上报而非被静默吞掉。新增调试接口 biliStatus（console 内运行）。SW 中转改为真正火与忘给 content，去除 swAccumSaves/relayToBiliTabs 旧死代码。"
+  "notes": "静默下载新增「更改下载目录」按钮 + 当前目录名显示：首次选过的目录不再被永久锁定。面板打开时从 IndexedDB 恢复已存目录名；点「更改下载目录」会在用户手势内重新 showDirectoryPicker、同步清空内存句柄与 IndexedDB，后续落盘即写入新目录；用户取消选择则静默忽略。不支持 File System Access API 的浏览器（如 Firefox）点按钮会提示改用下载栏模式。"
 }
