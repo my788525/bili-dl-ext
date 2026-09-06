@@ -1,0 +1,21 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <style>
+    body { font-family: -apple-system, "PingFang SC", system-ui, sans-serif; width: 320px; padding: 14px; color:#222; }
+    h3 { margin: 0 0 10px; color:#fb7299; font-size:15px; }
+    .ok { color:#2a9d4a; font-size:13px; line-height:1.6; }
+    .hint { margin-top:10px; font-size:11px; color:#999; line-height:1.6; }
+    code { background:#f4f4f4; padding:1px 5px; border-radius:4px; font-size:11px; }
+  </style>
+</head>
+<body>
+  <h3>Bilibili 下载器设置</h3>
+  <div class="ok">✅ ffmpeg 已内置本地（无需联网拉取）。<br>
+  合并由扩展内置的 <code>ffmpeg-core.wasm</code> 在本地完成，离线可用、不受 CDN 影响。</div>
+  <div class="hint">首次合并/转码会加载一次 wasm（约 24MB，已随扩展一起打包），之后浏览器缓存，速度快。
+  合并/转码在扩展内置的 Offscreen 文档内完成，离线可用。如需更新 ffmpeg 版本，替换扩展目录下的 <code>ffmpeg-core.js</code> 与 <code>ffmpeg-core.wasm</code> 即可。</div>
+  <script src="popup.js"></script>
+</body>
+</html>

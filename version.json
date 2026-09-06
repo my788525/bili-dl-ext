@@ -1,0 +1,6 @@
+{
+  "version": "1.0.0",
+  "release_url": "https://github.com/my788525/bili-dl-ext/releases/latest",
+  "min_chrome": "110",
+  "notes": "首个公开版本：多P批量下载、自定义文件名格式、行内进度填充（不阻塞、不卡99%）、浮动按钮可拖动并记忆位置、面板跟随按钮、版本检测与 GitHub 链接。"
+}

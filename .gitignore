@@ -1,0 +1,16 @@
+# 构建产物 / 发布包（release 附件由构建脚本生成，不入库）
+/dist/
+*.zip
+*.crx
+
+# 依赖（仅构建期使用，如 crx3 / archiver）
+/node_modules/
+
+# 操作系统 / 编辑器
+.DS_Store
+Thumbs.db
+*.swp
+
+# 本地配置
+.workbuddy/
+.env
