@@ -1,6 +1,6 @@
 {
-  "version": "1.1.3",
+  "version": "1.1.4",
   "release_url": "https://github.com/my788525/bili-dl-ext/releases/latest",
   "min_chrome": "110",
-  "notes": "静默下载新增「更改下载目录」按钮 + 当前目录名显示：首次选过的目录不再被永久锁定。面板打开时从 IndexedDB 恢复已存目录名；点「更改下载目录」会在用户手势内重新 showDirectoryPicker、同步清空内存句柄与 IndexedDB，后续落盘即写入新目录；用户取消选择则静默忽略。不支持 File System Access API 的浏览器（如 Firefox）点按钮会提示改用下载栏模式。"
+  "notes": "下载产物默认即为 Windows 通用的「H.264 视频 + AAC 音频 MP4」，彻底解决默认播放器打不开的问题。实现：content 侧选流时优先挑 AVC(H.264) 视频 + AAC 音频，offscreen 合并时先用 ffmpeg 探测源编码——已是通用编码则直接 -c copy 封装（秒级、不重编码）；仅当探测到 AV1/HEVC 视频或 E-AC3/FLAC 音频（少数极清档）才用 libx264+aac 重编码兜底。durl 合成流同样换装为通用 MP4 容器。注：wasm 版 x264 重编码较慢，但只在必要档位触发，绝大多数下载走快路径。"
 }

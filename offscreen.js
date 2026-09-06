@@ -29,6 +29,7 @@ const ffmpegCoreFactory = (typeof createFFmpegCore !== 'undefined')
       (self.module.exports.createFFmpegCore || self.module.exports)) || null);
 
 let corePromise = null;
+let coreLog = []; // 收集 ffmpeg printErr（用于探测源编码）
 function ensureCore() {
   if (!ffmpegCoreFactory) {
     return Promise.reject(new Error(
@@ -38,12 +39,12 @@ function ensureCore() {
   if (!corePromise) {
     corePromise = new Promise((resolve, reject) => {
       try {
-        const p = ffmpegCoreFactory({
-          print: () => {},        // 吞掉 ffmpeg 常规输出，避免刷屏
-          printErr: () => {},     // 同上
-          noExitRuntime: true,    // 允许复用同一个 core 处理多个 job
-          locateFile: (path) => chrome.runtime.getURL(path) // 解析 ffmpeg-core.wasm
-        });
+      const p = ffmpegCoreFactory({
+        print: () => {},        // 吞掉 ffmpeg 常规输出，避免刷屏
+        printErr: (...a) => { try { coreLog.push(a.map(String).join(' ')); } catch (_) {} }, // 收集日志供探测源编码
+        noExitRuntime: true,    // 允许复用同一个 core 处理多个 job
+        locateFile: (path) => chrome.runtime.getURL(path) // 解析 ffmpeg-core.wasm
+      });
         Promise.resolve(p).then(resolve).catch(reject);
       } catch (e) {
         reject(e);
@@ -84,6 +85,20 @@ function runFFmpegArgs(core, args) {
     freeArgv(core, info);
   }
   return ret;
+}
+
+// ---- 探测 DASH 源编码：用 ffmpeg 解析输入（不解码），从日志判断是否为 Windows 通用编码 ----
+// 返回 { videoUniversal, audioUniversal }：true 表示该流已是 H.264 视频 / AAC 音频，
+// 可直接 -c copy 封装（极快）；否则需经 libx264+aac 重编码兜底（慢但保证通用）。
+function probeCodecs(core) {
+  coreLog = [];
+  try {
+    runFFmpegArgs(core, ['ffmpeg', '-nostdin', '-i', 'v.m4s', '-i', 'a.m4s', '-f', 'null', '-']);
+  } catch (_) { /* 解析到 null muxer 会报错退出，属正常 */ }
+  const t = coreLog.join('\n');
+  const videoUniversal = /Video:\s*\S*?(h264|avc1|h\.264|mpeg4)/i.test(t);
+  const audioUniversal = /Audio:\s*\S*?(aac|mp4a)/i.test(t);
+  return { videoUniversal, audioUniversal };
 }
 
 // ---- 跨源下载 m4s（extension context + host_permissions，响应体可读）----
@@ -205,10 +220,24 @@ async function processJob(core, job, report, nameFormat, dir, saveAs, conflictAc
     if (job.kind === 'durl') {
       report('fetch', 0);
       const buf = await fetchToUint8(job.url, (p, speed) => report('fetch', p == null ? 0.5 : p, speed));
-      const ext = job.ext || (/\.flv(\?|$)/i.test(job.url) ? 'flv' : 'mp4');
-      const name = withDir(`${buildFileName(job, nf)}.${ext}`, dir);
-      await saveBlob(buf, name, saveAs, conflictAction, reqId);
-      report('fetch', 1.0); // 把进度条推到 100%（content 不再显示「保存中」中间态）
+      // 合成流（flv/mp4）统一换装为 H.264+AAC 的通用 MP4：
+      // B 站 flv 合成流多为 H.264+AAC，直接 copy 换容器即可（极快、Windows 默认可播）；
+      // 若源编码不被 mp4 容器接受（极少见），再重编码为 H.264+AAC 兜底。
+      core.FS.writeFile('in.bin', buf);
+      report('transcode', 0.7);
+      runFFmpegArgs(core, ['ffmpeg', '-nostdin', '-i', 'in.bin',
+        '-c', 'copy', '-movflags', '+faststart', 'out.mp4']);
+      let outBytes;
+      try { outBytes = core.FS.readFile('out.mp4'); } catch (_) { outBytes = null; }
+      if (!outBytes || outBytes.length < 1024) {
+        runFFmpegArgs(core, ['ffmpeg', '-nostdin', '-i', 'in.bin',
+          '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '23',
+          '-c:a', 'aac', '-b:a', '192k', '-movflags', '+faststart', 'out.mp4']);
+        outBytes = core.FS.readFile('out.mp4');
+      }
+      const name = withDir(`${buildFileName(job, nf)}.mp4`, dir);
+      await saveBlob(new Uint8Array(outBytes), name, saveAs, conflictAction, reqId);
+      report('fetch', 1.0);
       return { filename: name };
     }
 
@@ -244,7 +273,10 @@ async function processJob(core, job, report, nameFormat, dir, saveAs, conflictAc
       return { filename: name };
     }
 
-    // 默认：video —— 合并 DASH 分离的音视频轨为 mp4
+    // 默认：video —— 合并 DASH 分离的音视频轨为通用 MP4
+    // 策略：content 侧已优先选 avc(H.264) 视频 + aac 音频，绝大多数情况可直接 -c copy 封装
+    // （秒级、Windows 默认可播）。仅当探测到源仍是 av01/hev 视频或非 aac 音频（如某些只有
+    // AV1 版本的极清档）时才用 libx264+aac 重编码兜底，保证 100% 通用、且绝大多数下载极快。
     report('fetch', 0);
     let aP = 0, vP = 0;
     const [audio, video] = await Promise.all([
@@ -253,11 +285,28 @@ async function processJob(core, job, report, nameFormat, dir, saveAs, conflictAc
     ]);
     core.FS.writeFile('v.m4s', video);
     core.FS.writeFile('a.m4s', audio);
-    report('merge', 0.85);
-    runFFmpegArgs(core, ['ffmpeg', '-nostdin',
-      '-i', 'v.m4s', '-i', 'a.m4s',
-      '-c', 'copy', '-movflags', '+faststart', 'out.mp4']);
-    const out = core.FS.readFile('out.mp4');
+    const { videoUniversal, audioUniversal } = probeCodecs(core);
+    report('transcode', 0.85);
+    if (videoUniversal && audioUniversal) {
+      runFFmpegArgs(core, ['ffmpeg', '-nostdin',
+        '-i', 'v.m4s', '-i', 'a.m4s',
+        '-c', 'copy', '-movflags', '+faststart', 'out.mp4']);
+    } else {
+      runFFmpegArgs(core, ['ffmpeg', '-nostdin',
+        '-i', 'v.m4s', '-i', 'a.m4s',
+        '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '23',
+        '-c:a', 'aac', '-b:a', '192k', '-movflags', '+faststart', 'out.mp4']);
+    }
+    let out;
+    try { out = core.FS.readFile('out.mp4'); } catch (_) { out = null; }
+    if (!out || out.length < 1024) {
+      // 兜底：极端情况下连 copy/转码都未产出有效文件，再用 copy 试一次
+      try {
+        runFFmpegArgs(core, ['ffmpeg', '-nostdin', '-i', 'v.m4s', '-i', 'a.m4s',
+          '-c', 'copy', '-movflags', '+faststart', 'out.mp4']);
+        out = core.FS.readFile('out.mp4');
+      } catch (_) { out = null; }
+    }
     const name = withDir(`${buildFileName(job, nf)}.mp4`, dir);
     await saveBlob(new Uint8Array(out), name, saveAs, conflictAction, reqId);
     report('fetch', 1.0);

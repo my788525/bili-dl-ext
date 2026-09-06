@@ -751,10 +751,20 @@
   }
 
   // 流类型判别：DASH（分离音视频）优先，durl（已封装合成流）兜底
+  // 选流策略：B 站 DASH 同一清晰度常同时提供 avc(H.264) 与 av01/hev 两种视频编码、
+  //   音频也可能有 aac 与 dolby/flac。Windows 默认「电影和电视」仅支持 H.264+AAC，
+  //   故视频优先选 avc1、音频优先选 mp4a(aac)，从源头保证合并出的 mp4 通用且无需重编码（快）。
+  //   若某清晰度只有 av01 版本（极清档），无 avc 可筛时回退全部，交由 offscreen 探测后转码兜底。
   function classifyStreams(data) {
     if (data && data.dash && Array.isArray(data.dash.video) && data.dash.video.length) {
-      const videos = data.dash.video.slice().sort((a, b) => b.id - a.id);
-      const audio = (data.dash.audio || []).slice().sort((a, b) => (b.bandwidth || 0) - (a.bandwidth || 0))[0];
+      const allVideos = data.dash.video;
+      const avcVideos = allVideos.filter(v => /avc1|avc/i.test(v.codecs || ''));
+      const videos = (avcVideos.length ? avcVideos : allVideos).slice()
+        .sort((a, b) => b.id - a.id);
+      const allAudios = data.dash.audio || [];
+      const aacAudios = allAudios.filter(a => /mp4a|mp4a\.40/i.test(a.codecs || ''));
+      const chosenAudios = aacAudios.length ? aacAudios : allAudios;
+      const audio = chosenAudios.slice().sort((a, b) => (b.bandwidth || 0) - (a.bandwidth || 0))[0];
       return {
         type: 'dash',
         videos,
