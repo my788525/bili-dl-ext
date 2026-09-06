@@ -110,71 +110,25 @@ async function fetchToUint8(url, onProgress) {
   return out;
 }
 
-// ---- 落盘：必须经 SW 调 chrome.downloads.download（offscreen 里 chrome.downloads 是 undefined）----
+// ---- 落盘：把字节经 SW 中转回 content script，由 content 决定走 File System Access（静默）还是下载 API ----
 // 关键架构决策：chrome.downloads API 在 Chrome MV3 的 Offscreen Document 上下文中不可用
 // （Chrome 文档明确：可用上下文为 background/content/popup/options，offscreen 不在列表）。
-// 因此 offscreen 不能直接落盘，必须通过 chrome.runtime.connect('bili-dl-save') 开长连接，
-// 把 Uint8Array 用 transferable ArrayBuffer 分块转给 SW，SW 拼成 base64 data URL 后调
-// chrome.downloads.download。子目录下载失败时 SW 自动回退到 basename（兜底逻辑已迁到 SW）。
-async function saveBlob(uint8, filename, saveAs, conflictAction) {
-  const port = chrome.runtime.connect({ name: 'bili-dl-save' });
-
-  return new Promise((resolve, reject) => {
-    let acked = false;
-    port.onMessage.addListener((msg) => {
-      if (msg.type === 'ack') {
-        // SW 已准备接收，开始传块
-        sendChunks();
-      } else if (msg.type === 'done') {
-        port.disconnect();
-        resolve({ filename: msg.filename, fallback: msg.fallback });
-      } else if (msg.type === 'error') {
-        port.disconnect();
-        reject(new Error(msg.error));
-      }
+// 之前用 port 把字节转给 SW 再由 SW 调 chrome.downloads.download，但那样每文件都会弹下载栏，
+// 批量时浏览器像“卡住”。现改为把合并好的字节（Uint8Array）通过 sendMessage 经 SW 中转回
+// 视频页 content script，由 content 在「静默模式」下用 File System Access API 直接写目录
+// （完全不弹下载栏）；不支持 FS API 时回退到 chrome.downloads.download。
+async function saveBlob(uint8, filename, saveAs, conflictAction, reqId) {
+  await new Promise((resolve, reject) => {
+    chrome.runtime.sendMessage({
+      type: 'bili-dl-save',
+      reqId: reqId || null,
+      filename,
+      conflictAction: conflictAction || 'uniquify',
+      bytes: uint8
+    }, () => {
+      if (chrome.runtime.lastError) reject(new Error(chrome.runtime.lastError.message || '落盘中转失败'));
+      else resolve();
     });
-    port.onDisconnect.addListener(() => {
-      if (!acked) reject(new Error('落盘通道已断开（SW 可能未启动）'));
-    });
-
-    // 1. 先发 init（包含元数据），等 SW 回 ack 再发块（避免 SW 还没准备好就丢数据）
-    try {
-      port.postMessage({
-        type: 'init', filename, saveAs: !!saveAs,
-        conflictAction: conflictAction || 'uniquify',
-        totalSize: uint8.length
-      });
-    }
-    catch (e) { port.disconnect(); reject(new Error('启动落盘通道失败：' + String(e.message || e))); }
-
-    function sendChunks() {
-      if (acked) return;
-      acked = true;
-      const CHUNK = 8 * 1024 * 1024; // 8MB 原始数据 / 块（transferable ArrayBuffer）
-      const total = uint8.length;
-      let offset = 0;
-      const next = () => {
-        if (offset >= total) {
-          try { port.postMessage({ type: 'final' }); } catch (_) { /* 已断开 */ }
-          return;
-        }
-        const slice = uint8.subarray(offset, Math.min(offset + CHUNK, total));
-        // 必须 .slice() 创建独立 ArrayBuffer 才能 transferable（原 subarray 共享底层 buffer）
-        const standalone = slice.slice();
-        try {
-          port.postMessage({ type: 'chunk', buffer: standalone.buffer }, [standalone.buffer]);
-        } catch (e) {
-          port.disconnect();
-          reject(new Error('传输失败：' + String(e.message || e)));
-          return;
-        }
-        offset += CHUNK;
-        // Yield 让 SW 有机会 ack / 处理
-        if (offset < total) setTimeout(next, 0);
-        else next();
-      };
-      next();
-    }
   });
 }
 
@@ -226,7 +180,7 @@ function buildFileName(job, nf) {
 }
 
 // ---- 单个 job 处理 ----
-async function processJob(core, job, report, nameFormat, dir, saveAs, conflictAction) {
+async function processJob(core, job, report, nameFormat, dir, saveAs, conflictAction, reqId) {
   const nf = nameFormat || { title: true, pn: true, part: true, qn: true };
   try {
     if (job.kind === 'durl') {
@@ -234,7 +188,7 @@ async function processJob(core, job, report, nameFormat, dir, saveAs, conflictAc
       const buf = await fetchToUint8(job.url, (p, speed) => report('fetch', p == null ? 0.5 : p, speed));
       const ext = job.ext || (/\.flv(\?|$)/i.test(job.url) ? 'flv' : 'mp4');
       const name = withDir(`${buildFileName(job, nf)}.${ext}`, dir);
-      await saveBlob(buf, name, saveAs, conflictAction);
+      await saveBlob(buf, name, saveAs, conflictAction, reqId);
       report('fetch', 1.0); // 把进度条推到 100%（content 不再显示「保存中」中间态）
       return { filename: name };
     }
@@ -266,7 +220,7 @@ async function processJob(core, job, report, nameFormat, dir, saveAs, conflictAc
       }
       const out = core.FS.readFile(outName);
       const name = withDir(`${buildFileName(job, nf)}.${ext}`, dir);
-      await saveBlob(new Uint8Array(out), name, saveAs, conflictAction);
+      await saveBlob(new Uint8Array(out), name, saveAs, conflictAction, reqId);
       report('fetch', 1.0);
       return { filename: name };
     }
@@ -286,7 +240,7 @@ async function processJob(core, job, report, nameFormat, dir, saveAs, conflictAc
       '-c', 'copy', '-movflags', '+faststart', 'out.mp4']);
     const out = core.FS.readFile('out.mp4');
     const name = withDir(`${buildFileName(job, nf)}.mp4`, dir);
-    await saveBlob(new Uint8Array(out), name, saveAs, conflictAction);
+    await saveBlob(new Uint8Array(out), name, saveAs, conflictAction, reqId);
     report('fetch', 1.0);
     return { filename: name };
   } finally {
@@ -320,9 +274,12 @@ async function handleTask(msg) {
     : { title: true, pn: true, part: true, qn: true };
   // 下载位置：dir 为相对下载目录的子文件夹；saveAs 为是否弹出系统“另存为”对话框
   const dir = (typeof msg.dir === 'string') ? msg.dir : '';
-  const saveAs = !!msg.saveAs;
+  const saveAs = (msg.saveAs === true);
   const conflictAction = (msg.conflictAction === 'overwrite' || msg.conflictAction === 'prompt' || msg.conflictAction === 'uniquify')
     ? msg.conflictAction : 'uniquify';
+  // 并发路数：1=单文件依次（最稳，避免批量时卡顿），≥2=多线程提速（默认 3，由 content 设置传入）
+  const concurrency = (typeof msg.concurrency === 'number' && msg.concurrency >= 1 && msg.concurrency <= 6)
+    ? Math.floor(msg.concurrency) : 3;
   const total = jobs.length;
   const results = new Array(total);
 
@@ -337,8 +294,8 @@ async function handleTask(msg) {
     return;
   }
 
-  // ---- 并发池：最多 3 路同时处理，大合集提速数倍，且单 P 失败不影响其他 ----
-  const CONCURRENCY = 3;
+  // ---- 并发池：由 content 设置的 concurrency 控制（单文件依次=1，多线程=≥2）----
+  const CONCURRENCY = concurrency;
   let nextIdx = 0;
   let cancelled = false;
 
@@ -357,7 +314,7 @@ async function handleTask(msg) {
         } catch (_) {}
       };
       try {
-        const r = await processJob(core, job, report, nameFormat, dir, saveAs, conflictAction);
+        const r = await processJob(core, job, report, nameFormat, dir, saveAs, conflictAction, reqId);
         results[i] = { ok: true, filename: r.filename, fallback: r.fallback, cid: (job && typeof job.cid === 'number') ? job.cid : undefined };
         report('done', 1);
       } catch (e) {

@@ -215,6 +215,25 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       .catch(e => sendResponse({ ok: false, error: String(e.message || e) }));
     return true; // 异步
   }
+  // 落盘中转：offscreen 把合并好的字节发来，由 SW 转投到视频页 content script 静默直写
+  // （File System Access API 仅在页面/扩展窗口上下文可用，SW 内不可用，故必须绕到 content）。
+  // 若中转失败（如 content 未注入），则 SW 自身用 chrome.downloads.download 兜底落盘。
+  if (msg.type === 'bili-dl-save') {
+    (async () => {
+      let relayed = false;
+      try { await relayToBiliTabs(msg); relayed = true; } catch (_) {}
+      if (!relayed) {
+        try {
+          const blob = new Blob([msg.bytes]);
+          const url = URL.createObjectURL(blob);
+          await chrome.downloads.download({ url, filename: msg.filename, saveAs: false, conflictAction: msg.conflictAction || 'uniquify' });
+          setTimeout(() => URL.revokeObjectURL(url), 2000);
+        } catch (e) { console.warn('[bili-dl] 落盘兜底失败', e); }
+      }
+      try { sendResponse({ ok: true }); } catch (_) {}
+    })();
+    return true; // 异步
+  }
   // 'bili-dl-task' / 'bili-dl-cancel' / 'bili-dl-selftest' 由 offscreen 文档处理，SW 不响应
   // 'bili-dl-progress' / 'bili-dl-done' / 'bili-dl-selftest-result' 已在上面中转到对应标签页
 });
@@ -239,81 +258,5 @@ async function ensureOffscreen() {
   });
 }
 
-// ---- 落盘中转：chrome.downloads 在 offscreen 不可用，由 SW 代为落盘 ----
-// offscreen 通过 chrome.runtime.connect('bili-dl-save') 开长连接，把 Uint8Array 用
-// transferable ArrayBuffer 分块转给 SW。SW 拼装为 base64 data URL，调 chrome.downloads
-// 下载（Chrome 78+ 自动建子目录）。子目录不存在时自动回退到 basename。
-chrome.runtime.onConnect.addListener((port) => {
-  if (port.name !== 'bili-dl-save') return;
-  let state = null;
-  port.onDisconnect.addListener(() => { state = null; });
-  port.onMessage.addListener(async (msg) => {
-    try {
-      if (msg.type === 'init') {
-        state = {
-          filename: msg.filename, saveAs: !!msg.saveAs, totalSize: msg.totalSize,
-          conflictAction: (msg.conflictAction === 'overwrite' || msg.conflictAction === 'prompt' || msg.conflictAction === 'uniquify')
-            ? msg.conflictAction : 'uniquify',
-          chunks: []
-        };
-        port.postMessage({ type: 'ack' });
-      } else if (msg.type === 'chunk' && state) {
-        // msg.buffer 已被 transferable 转移（offscreen 端已 detached，此处是新 buffer）
-        state.chunks.push(new Uint8Array(msg.buffer));
-      } else if (msg.type === 'final' && state) {
-        await saveViaDataUrl(port, state);
-        state = null;
-      }
-    } catch (e) {
-      try { port.postMessage({ type: 'error', error: String(e.message || e) }); } catch (_) {}
-      state = null;
-    }
-  });
-});
-
-async function saveViaDataUrl(port, state) {
-  // 拼装所有块为完整 Uint8Array
-  const out = new Uint8Array(state.totalSize);
-  let offset = 0;
-  for (const c of state.chunks) { out.set(c, offset); offset += c.length; }
-
-  // 构造 data URL（base64 编码，分块避免 btoa 栈溢出）
-  const STEP = 0x8000; // 32KB
-  let binary = '';
-  for (let i = 0; i < out.length; i += STEP) {
-    binary += String.fromCharCode.apply(null, out.subarray(i, i + STEP));
-  }
-  const dataUrl = 'data:application/octet-stream;base64,' + btoa(binary);
-
-  // 调 chrome.downloads.download 落盘（带子目录的 filename 由 Chrome 78+ 自动创建子目录）
-  try {
-    await chrome.downloads.download({
-      url: dataUrl,
-      filename: state.filename,
-      saveAs: state.saveAs,
-      conflictAction: state.conflictAction || 'uniquify'
-    });
-    port.postMessage({ type: 'done', filename: state.filename });
-  } catch (e) {
-    // 兜底：去掉子目录前缀再试（子目录不存在等场景），UI 端会提示用户去手动创建子目录
-    const base = state.filename.split('/').pop();
-    if (base !== state.filename) {
-      try {
-        await chrome.downloads.download({
-          url: dataUrl,
-          filename: base,
-          saveAs: state.saveAs,
-          conflictAction: state.conflictAction || 'uniquify'
-        });
-        port.postMessage({
-          type: 'done', filename: base,
-          fallback: '子目录不存在，已落默认下载目录'
-        });
-      } catch (e2) {
-        port.postMessage({ type: 'error', error: String(e2.message || e2) });
-      }
-    } else {
-      port.postMessage({ type: 'error', error: String(e.message || e) });
-    }
-  }
-}
+// ---- 落盘中转：offscreen 现已改为经 sendMessage(type:'bili-dl-save') 把字节发来，由 SW 转投
+// content script 静默直写（见 onMessage 中的 'bili-dl-save' 分支）。旧的 port 长连接落盘逻辑已弃用。 ----

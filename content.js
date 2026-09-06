@@ -230,6 +230,83 @@
     try { chrome.storage.local.set({ [DEDUP_KEY]: Array.from(downloadedCids) }); } catch (_) {}
   }
 
+  // ---------- 静默下载（File System Access API 直接写目录，不弹浏览器下载栏）----------
+  // 默认开启：首次下载时由用户手势授权一个目录（如“下载/BiliDL”），之后所有文件静默写入，
+  // 不再触发 Chrome 下载栏/逐文件弹窗（saveAs:false 仍会弹栏，只有 FS API 能彻底静默）。
+  // 不支持 FS API（如 Firefox）或用户拒绝授权时，自动回退到 chrome.downloads.download（仍会显示下载栏）。
+  const CONC_KEY = 'bili_dl_concurrency'; // 并发下载路数：1=单文件依次，≥2=多线程
+  let fsDirHandle = null; // 已授权的目录句柄（内存缓存）
+  function idbOpen() {
+    return new Promise((res, rej) => {
+      const r = indexedDB.open('bili-dl-fs', 1);
+      r.onupgradeneeded = () => { try { r.result.createObjectStore('kv'); } catch (_) {} };
+      r.onsuccess = () => res(r.result);
+      r.onerror = () => rej(r.error);
+    });
+  }
+  async function idbGet(k) {
+    const db = await idbOpen();
+    return new Promise((res, rej) => {
+      const tx = db.transaction('kv', 'readonly');
+      const rq = tx.objectStore('kv').get(k);
+      rq.onsuccess = () => res(rq.result);
+      rq.onerror = () => rej(rq.error);
+    });
+  }
+  async function idbSet(k, v) {
+    const db = await idbOpen();
+    return new Promise((res, rej) => {
+      const tx = db.transaction('kv', 'readwrite');
+      tx.objectStore('kv').put(v, k);
+      tx.oncomplete = () => res();
+      tx.onerror = () => rej(tx.error);
+    });
+  }
+  // 在用户手势内（点下载按钮时）确保已拿到目录句柄；返回后 fsDirHandle 即用
+  async function prepareSilentHandle() {
+    if (!window.showDirectoryPicker) return; // 环境不支持 FS API → 走下载 API 兜底
+    if (fsDirHandle) {
+      try { if ((await fsDirHandle.requestPermission({ mode: 'readwrite' })) === 'granted') return; } catch (_) {}
+    }
+    const stored = await idbGet('dirHandle').catch(() => null);
+    if (stored) {
+      try {
+        if ((await stored.requestPermission({ mode: 'readwrite' })) === 'granted') { fsDirHandle = stored; return; }
+      } catch (_) {}
+    }
+    fsDirHandle = await window.showDirectoryPicker({ mode: 'readwrite' }); // 必须处在用户手势中
+    await idbSet('dirHandle', fsDirHandle).catch(() => {});
+  }
+  // 把字节写入磁盘：静默模式 + 句柄就绪 → FS API 直写（无下载栏）；否则回退下载 API
+  async function writeFileSilent(filename, uint8) {
+    const silent = getSilent();
+    if (silent && window.showDirectoryPicker && fsDirHandle) {
+      try {
+        const parts = String(filename).split('/').filter(Boolean);
+        const name = parts.pop();
+        let dir = fsDirHandle;
+        for (const p of parts) dir = await dir.getDirectoryHandle(p, { create: true });
+        const fh = await dir.getFileHandle(safeName(name), { create: true });
+        const w = await fh.createWritable();
+        await w.write(new Blob([uint8]));
+        await w.close();
+        return { ok: true, filename, silent: true };
+      } catch (_) { /* 落到下载 API 兜底 */ }
+    }
+    const blob = new Blob([uint8]);
+    const url = URL.createObjectURL(blob);
+    try {
+      await chrome.downloads.download({ url, filename, saveAs: false, conflictAction: getConflictAction() });
+      return { ok: true, filename };
+    } finally { setTimeout(() => URL.revokeObjectURL(url), 1500); }
+  }
+  function getSilent() { const el = document.getElementById('bili-dl-silent'); return el ? el.checked : true; }
+  function getConcurrency() {
+    const el = document.getElementById('bili-dl-conc');
+    const v = el ? parseInt(el.value, 10) : 3;
+    return (v >= 1 && v <= 6) ? v : 3;
+  }
+
   // 字幕 JSON -> ASS 文本转换（B站字幕为内部 JSON 格式，转成通用 ASS 便于播放器加载）
   function assTime(sec) {
     sec = Math.max(0, sec || 0);
@@ -261,6 +338,8 @@
   const FMT_KEY = 'bili_dl_namefmt';
   const DIR_KEY = 'bili_dl_dir';
   const SAVEAS_KEY = 'bili_dl_saveas';
+  // 静默下载（默认开启）：开启时走 File System Access API 直接写目录，不弹浏览器下载栏
+  const SILENT_KEY = 'bili_dl_silent';
 
   // 清洗下载子目录（与 offscreen.sanitizeDir 规则一致：相对路径、防跳出、去非法字符、限长）
   function sanitizeDirInput(d) {
@@ -320,7 +399,7 @@
   }
 
   // 把 job 列表交给 offscreen 处理（offscreen 内完成取流+合并+落盘）
-  async function dispatchTask(jobs, nameFormat, dir, saveAs, conflictAction) {
+  async function dispatchTask(jobs, nameFormat, dir, saveAs, conflictAction, concurrency) {
     if (!jobs || !jobs.length) { setStatus('没有可下载的流'); return; }
     currentReqId = 'r' + Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
     doneReceived = false; // 新一轮：清空 done 守卫
@@ -337,7 +416,8 @@
       nameFormat: nameFormat || getNameFormat(),
       dir: (typeof dir === 'string') ? dir : getDir(),
       saveAs: (typeof saveAs === 'boolean') ? saveAs : getSaveAs(),
-      conflictAction: (typeof conflictAction === 'string') ? conflictAction : getConflictAction()
+      conflictAction: (typeof conflictAction === 'string') ? conflictAction : getConflictAction(),
+      concurrency: (typeof concurrency === 'number') ? concurrency : getConcurrency()
     });
     armBatchTimeout(); // 兜底：5 分钟未收到 done 时强制复位
   }
@@ -469,6 +549,10 @@
         // 用户看到的反馈就是各分P 行内色块横向填充，单行完成立即变深绿 + ✓，
         // 全部完成时才闪一次底部状态条 + Toast。
         onBatchProgress(msg);
+      } else if (msg.type === 'bili-dl-save' && msg.reqId === currentReqId) {
+        // offscreen 把合并好的字节经 SW 中转回 content，由 content 落盘：
+        // 静默模式走 File System Access API 直接写目录（无下载栏），否则回退下载 API。
+        writeFileSilent(msg.filename, new Uint8Array(msg.bytes)).catch(e => console.warn('[bili-dl] 落盘失败', e));
       } else if (msg.type === 'bili-dl-done' && msg.reqId === currentReqId) {
         // 【本地真相源】tryLocalDone() 可能已先行触发（按 progress 自动复位）。
         // 如果已经触发过，done 仅用作 success/fallback 统计补全，不重复写文案。
@@ -751,6 +835,17 @@
               <label class="extra-chk"><input type="checkbox" id="bili-dl-aux-sub"> 字幕</label>
               <label class="extra-chk"><input type="checkbox" id="bili-dl-aux-dm"> 弹幕</label>
               <label class="extra-chk"><input type="checkbox" id="bili-dl-aux-cover"> 封面</label>
+              <label class="extra-chk" style="width:100%"><input type="checkbox" id="bili-dl-silent" checked> 静默下载（推荐·不走浏览器下载栏，直接写目录）</label>
+              <div class="bili-dl-conflict">
+                <span>并发下载</span>
+                <select id="bili-dl-conc">
+                  <option value="1">单文件依次（1 路，最稳）</option>
+                  <option value="2">2 路并发</option>
+                  <option value="3" selected>3 路并发（推荐）</option>
+                  <option value="4">4 路并发</option>
+                  <option value="6">6 路并发（激进）</option>
+                </select>
+              </div>
               <div class="bili-dl-conflict">
                 <span>文件名冲突</span>
                 <select id="bili-dl-conflict">
@@ -822,6 +917,16 @@
       updateFmtPreview();
     };
     saveasCb.onchange = () => { saveDir(); if (ctx) renderList(); };
+
+    // 静默下载 / 并发路数：持久化跨页面保留
+    const silentCb = $('#bili-dl-silent'), concSel = $('#bili-dl-conc');
+    const saveSilent = () => chrome.storage.local.set({ [SILENT_KEY]: silentCb.checked, [CONC_KEY]: parseInt(concSel.value, 10) || 3 });
+    chrome.storage.local.get([SILENT_KEY, CONC_KEY], (s) => {
+      if (typeof s[SILENT_KEY] === 'boolean') silentCb.checked = s[SILENT_KEY];
+      if (typeof s[CONC_KEY] === 'number') concSel.value = String(Math.min(6, Math.max(1, s[CONC_KEY])));
+    });
+    silentCb.onchange = saveSilent;
+    concSel.onchange = saveSilent;
 
     // 设置栏（统一收纳：仅下载音频 / 文件名格式 / 下载位置 / 测试 ffmpeg）：默认折叠，展开状态持久化
     const SETTINGS_OPEN_KEY = 'bili_dl_settings_open';
@@ -1207,29 +1312,33 @@
 
     async function startVideo(videoUrl, audioUrl, title, qn, page, part) {
       if (!videoUrl) { setStatus('该清晰度直链缺失'); return; }
+      if (getSilent()) { try { await prepareSilentHandle(); } catch (_) {} }
       ctx = null;
-      dispatchTask([{ kind: 'video', videoUrl, audioUrl, title, page: page || 0, part: part || '', qn: qn || 0 }], getNameFormat());
+      dispatchTask([{ kind: 'video', videoUrl, audioUrl, title, page: page || 0, part: part || '', qn: qn || 0 }], getNameFormat(), undefined, undefined, undefined, getConcurrency());
     }
 
     async function startAudio(title, _unused, audioUrl, fmt, page, part) {
       if (!audioUrl) { setStatus('音轨直链缺失'); return; }
+      if (getSilent()) { try { await prepareSilentHandle(); } catch (_) {} }
       ctx = null;
-      dispatchTask([{ kind: 'audio', audioUrl, title, page: page || 0, part: part || '', audioFormat: fmt }], getNameFormat());
+      dispatchTask([{ kind: 'audio', audioUrl, title, page: page || 0, part: part || '', audioFormat: fmt }], getNameFormat(), undefined, undefined, undefined, getConcurrency());
     }
 
     // durl 合成流：直接下载，无需 ffmpeg 合并（offscreen 内完成落盘）
     async function startDurl(url, title, page, part) {
       if (!url) { setStatus('合成流直链缺失'); return; }
+      if (getSilent()) { try { await prepareSilentHandle(); } catch (_) {} }
       ctx = null;
       const ext = /\.flv(\?|$)/i.test(url) ? 'flv' : 'mp4';
-      dispatchTask([{ kind: 'durl', url, title, page: page || 0, part: part || '', ext }], getNameFormat());
+      dispatchTask([{ kind: 'durl', url, title, page: page || 0, part: part || '', ext }], getNameFormat(), undefined, undefined, undefined, getConcurrency());
     }
 
     // durl 合成流提取音频（offscreen 内完成落盘）
     async function startDurlAudio(url, title, fmt, page, part) {
       if (!url) { setStatus('合成流直链缺失'); return; }
+      if (getSilent()) { try { await prepareSilentHandle(); } catch (_) {} }
       ctx = null;
-      dispatchTask([{ kind: 'durl-audio', url, title, page: page || 0, part: part || '', audioFormat: fmt }], getNameFormat());
+      dispatchTask([{ kind: 'durl-audio', url, title, page: page || 0, part: part || '', audioFormat: fmt }], getNameFormat(), undefined, undefined, undefined, getConcurrency());
     }
 
     // 单分P 重试：仅重下失败的那个（复用 getPageStreams + dispatchTask 单 job）
@@ -1248,6 +1357,7 @@
       const partName = isMulti ? (page.part || '') : '';
       const label = isMulti ? ('P' + String(pageNo).padStart(2, '0') + (partName ? '_' + safeName(partName) : '')) : '';
       const audonlyMode = audonly.checked;
+      if (getSilent()) { try { await prepareSilentHandle(); } catch (_) {} }
       try {
         const cls = await getPageStreams(bvid, page);
         let job = null;
@@ -1271,7 +1381,7 @@
         }
         setStatus('正在重试 P' + String(pageNo).padStart(2, '0') + '…');
         failErrors.delete(cid);
-        dispatchTask([job], nf);
+        dispatchTask([job], nf, undefined, undefined, undefined, getConcurrency());
         if (cid != null) markRow(cid, 'running');
       } catch (e) {
         setStatus('重试失败：' + (e && e.message ? e.message : e));
@@ -1292,9 +1402,15 @@
       return segs.length ? segs.join('_') : 'bili-dl';
     }
     async function directDownload(url, filename) {
+      if (getSilent() && window.showDirectoryPicker && fsDirHandle) {
+        try { const buf = await (await fetch(url)).arrayBuffer(); await writeFileSilent(filename, new Uint8Array(buf)); return; } catch (_) {}
+      }
       await chrome.downloads.download({ url, filename, saveAs: false, conflictAction: getConflictAction() });
     }
     async function directDownloadText(text, filename, mime) {
+      if (getSilent() && window.showDirectoryPicker && fsDirHandle) {
+        try { await writeFileSilent(filename, new TextEncoder().encode(text)); return; } catch (_) {}
+      }
       const b64 = btoa(unescape(encodeURIComponent(text)));
       await chrome.downloads.download({ url: `data:${mime || 'application/octet-stream'};base64,${b64}`, filename, saveAs: false, conflictAction: getConflictAction() });
     }
@@ -1339,6 +1455,8 @@
       const bvid = ctx ? ctx.bvid : null;
       const isMulti = ctx && ctx.pages.length > 1; // 仅多P合集才带 PN/选集名称
       const nf = getNameFormat();
+      // 静默模式：在用户手势内预取目录句柄（首次会弹系统目录选择框，之后记忆）
+      if (getSilent()) { try { await prepareSilentHandle(); } catch (_) {} }
       // 去重：勾选了「跳过已下载」时，已成功下载过的 cid 自动跳过
       const dedupOn = document.getElementById('bili-dl-dedup') && document.getElementById('bili-dl-dedup').checked;
       let skipCount = 0;
@@ -1377,7 +1495,7 @@
         return;
       }
       if (skipCount) setStatus(`已跳过 ${skipCount} 个已下载分P，正在下载其余 ${valid.length} 个…`);
-      dispatchTask(valid, nf); // 设置 currentReqId / currentBatchMeta
+      dispatchTask(valid, nf, undefined, undefined, undefined, getConcurrency()); // 设置 currentReqId / currentBatchMeta
       // 进入运行态：禁用勾选、按钮变「取消」
       batchRunning = true;
       rowEls.forEach(r => { if (r.cb) { r.cb.disabled = true; r.row.classList.add('cb-disabled'); } });
