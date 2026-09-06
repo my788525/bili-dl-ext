@@ -212,47 +212,140 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       .catch(e => sendResponse({ ok: false, error: String(e.message || e) }));
     return true; // 异步
   }
-  // 落盘中转：offscreen 把合并好的字节发来，由 SW 转投到视频页 content script 静默直写
-  // （File System Access API 仅在页面/扩展窗口上下文可用，SW 内不可用，故必须绕到 content）。
-  // 若中转失败（如 content 未注入），则 SW 自身用 chrome.downloads.download 兜底落盘。
-  if (msg.type === 'bili-dl-save' || msg.type === 'bili-dl-save-chunk' || msg.type === 'bili-dl-save-final') {
-    // 火与忘转发给 content：不等 tabs.sendMessage 回执（content 不需要回它），避免
-    // SW listener return true 后等 sendResponse 导致 offscreen sendMessage 回调永不触发、
-    // 链路上游 await 死锁。
-    (async () => {
-      let relayedCount = 0;
-      try {
-        const tabs = await getBiliTabs();
-        // 不用 Promise.all 等回执——只投递，content 端 listener 同步处理后不再回 sendResponse
-        for (const t of tabs || []) {
-          try { chrome.tabs.sendMessage(t.id, msg); relayedCount++; } catch (_) {}
-        }
-      } catch (_) {}
-      // 仅当 final 时才考虑下载 API 兜底（chunk 阶段拼装无意义）
-      if (relayedCount === 0 && msg.type === 'bili-dl-save-final') {
-        try {
-          const blob = new Blob([new Uint8Array(0)]); // chunk 缺失无法落地，给出明确兜底
-          const url = URL.createObjectURL(blob);
-          await chrome.downloads.download({ url, filename: msg.filename, saveAs: false, conflictAction: msg.conflictAction || 'uniquify' });
-          setTimeout(() => URL.revokeObjectURL(url), 2000);
-        } catch (e) { console.warn('[bili-dl] 无标签页兜底失败', e); }
-      }
-      try { sendResponse({ ok: true, relayed: relayedCount }); } catch (_) {}
-    })();
-    return true; // 异步
+  // 落盘消息现由 onConnect('bili-dl-save') 长连接处理（见下方 chrome.runtime.onConnect），
+  // 不再走 onMessage 分块 relay（分块经 SW 中转 content 在批量/并发或 SW 重启时易丢块，
+  // 导致文件错位损坏——这正是 v1.1.x「能保存但打不开」的根因）。
+});
+
+// ---------- 落盘：offscreen → SW 长连接（transferable ArrayBuffer 分块）→ SW 落盘 ----------
+// 沿用 v1.0.0 的可靠方案：offscreen 在合并完每个文件后，开一条 chrome.runtime.connect('bili-dl-save')
+// 长连接，把合并好的字节按 8MB 切块、用 transferable ArrayBuffer 直接传给 SW（不经过 content，
+// 绝不会因多跳中转丢块）。SW 收齐后：
+//   • 默认（非静默）：直接 chrome.downloads.download（字节绝对精确，v1.0.0 原路径，保证能播）；
+//   • 静默：字节写入 IndexedDB 中转给 content，由 content 走 File System Access 直写目录（不弹下载栏）。
+// 仅当 content 未注入（极少）时，SW 才用 data URL 直接下载兜底。
+// 索引数据库辅助（与 content 共享同源 DB bili-dl-fs / store kv，键前缀 bili-save-）
+function idbOpenSave() {
+  return new Promise((res, rej) => {
+    const r = indexedDB.open('bili-dl-fs', 1);
+    r.onupgradeneeded = () => { try { r.result.createObjectStore('kv'); } catch (_) {} };
+    r.onsuccess = () => res(r.result);
+    r.onerror = () => rej(r.error);
+  });
+}
+async function idbSetSave(k, v) {
+  const db = await idbOpenSave();
+  return new Promise((res, rej) => {
+    const tx = db.transaction('kv', 'readwrite');
+    tx.objectStore('kv').put(v, k);
+    tx.oncomplete = () => res();
+    tx.onerror = () => rej(tx.error);
+  });
+}
+async function idbGetSave(k) {
+  const db = await idbOpenSave();
+  return new Promise((res, rej) => {
+    const tx = db.transaction('kv', 'readonly');
+    const rq = tx.objectStore('kv').get(k);
+    rq.onsuccess = () => res(rq.result);
+    rq.onerror = () => rej(rq.error);
+  });
+}
+async function idbDeleteSave(k) {
+  const db = await idbOpenSave();
+  return new Promise((res, rej) => {
+    const tx = db.transaction('kv', 'readwrite');
+    tx.objectStore('kv').delete(k);
+    tx.oncomplete = () => res();
+    tx.onerror = () => rej(tx.error);
+  });
+}
+// 把 Uint8Array 转 base64 data URL（分块避免 btoa 栈溢出），用于 SW 直接下载兜底
+function bytesToDataUrl(buf) {
+  const u = (buf instanceof Uint8Array) ? buf : new Uint8Array(buf);
+  const STEP = 0x8000;
+  let binary = '';
+  for (let i = 0; i < u.length; i += STEP) binary += String.fromCharCode.apply(null, u.subarray(i, i + STEP));
+  return 'data:application/octet-stream;base64,' + btoa(binary);
+}
+async function downloadBytesViaApi(bytes, meta, port) {
+  const tryOnce = async (filename) => {
+    const url = bytesToDataUrl(bytes);
+    await chrome.downloads.download({ url, filename, saveAs: meta.saveAs, conflictAction: meta.conflictAction });
+    return filename;
+  };
+  try {
+    const fn = await tryOnce(meta.filename);
+    port.postMessage({ type: 'done', filename: fn });
+  } catch (e) {
+    const base = meta.filename.split('/').pop();
+    if (base !== meta.filename) {
+      try { const fn = await tryOnce(base); port.postMessage({ type: 'done', filename: fn, fallback: '子目录不存在，已落默认下载目录' }); }
+      catch (e2) { port.postMessage({ type: 'error', error: String(e2.message || e2) }); }
+    } else {
+      port.postMessage({ type: 'error', error: String(e.message || e) });
+    }
   }
-  // 'bili-dl-task' / 'bili-dl-cancel' / 'bili-dl-selftest' 由 offscreen 文档处理，SW 不响应
-  // 'bili-dl-progress' / 'bili-dl-done' / 'bili-dl-selftest-result' 已在上面中转到对应标签页
+}
+
+chrome.runtime.onConnect.addListener((port) => {
+  if (port.name !== 'bili-dl-save') return;
+  let state = null;
+  port.onDisconnect.addListener(() => { state = null; });
+  port.onMessage.addListener(async (msg) => {
+    try {
+      if (msg.type === 'init') {
+        state = {
+          fileId: msg.fileId,
+          filename: msg.filename,
+          saveAs: (msg.saveAs === true),
+          conflictAction: (msg.conflictAction === 'overwrite' || msg.conflictAction === 'prompt' || msg.conflictAction === 'uniquify') ? msg.conflictAction : 'uniquify',
+          silent: (msg.silent === true),
+          totalSize: msg.totalSize || 0,
+          cid: (typeof msg.cid === "number") ? msg.cid : null,
+          reqId: msg.reqId || null,
+          chunks: []
+        };
+        port.postMessage({ type: 'ready' });
+      } else if (msg.type === 'chunk' && state) {
+        state.chunks.push(new Uint8Array(msg.buffer));
+      } else if (msg.type === 'final' && state) {
+        const out = new Uint8Array(state.totalSize);
+        let pos = 0;
+        for (const c of state.chunks) { out.set(c, pos); pos += c.length; }
+        const meta = { filename: state.filename, saveAs: state.saveAs, conflictAction: state.conflictAction, reqId: state.reqId };
+        // 统一写 IndexedDB 中转给 content（content 同时具备 FS API 静默直写与下载 API 兜底能力）；
+        // 仅当无 bili 标签页（content 未注入）时，SW 才直接 data URL 下载兜底。
+        await idbSetSave('bili-save-' + state.fileId, out);
+        const tabs = await getBiliTabs();
+        const relay = {
+          type: 'bili-dl-write', fileId: state.fileId, filename: state.filename,
+          conflictAction: state.conflictAction, reqId: state.reqId, silent: state.silent, cid: state.cid
+        };
+        let delivered = 0;
+        for (const t of tabs || []) { try { await chrome.tabs.sendMessage(t.id, relay); delivered++; } catch (_) {} }
+        if (delivered === 0) {
+          await downloadBytesViaApi(out, meta, port);
+        } else {
+          port.postMessage({ type: 'done', filename: state.filename });
+        }
+        state = null;
+      }
+    } catch (e) {
+      try { port.postMessage({ type: 'error', error: String(e.message || e) }); } catch (_) {}
+      state = null;
+    }
+  });
 });
 
 // ---------- Offscreen Document（主线程承载 ffmpeg.wasm） ----------
 // ffmpeg 合并/转码放到扩展同源 Offscreen Document 的「主线程」执行（Chrome 109+）。
 // offscreen.html 用 <script> 注入 ffmpeg-core.js（顶部 var createFFmpegCore 已挂全局），
 // 由 offscreen.js 直接 ccall('main') 驱动。整条流水线（取流→ffmpeg 合并/转码→落盘），
-// 取流/合并在 offscreen 内完成；落盘由 offscreen 把合并好的字节按 8MB 分块经
-// sendMessage({type:'bili-dl-save-chunk'/'-final'}) 发来，SW 中转回视频页 content 静默直写
-// （File System Access API 只在页面/扩展窗口上下文可用，offscreen 与 SW 内均不可用；
-// 故必须绕到 content 落盘；分块是为规避扩展消息体积上限，避免大视频整包发送超限失败）。
+  // 取流/合并在 offscreen 内完成；落盘由 offscreen 经 chrome.runtime.connect('bili-dl-save')
+  // 长连接把字节用 transferable ArrayBuffer 分块发来，SW 收齐后在「静默模式」写入 IndexedDB
+  // 中转给 content 走 File System Access 直写；非静默则 SW 直接 chrome.downloads.download。
+  // 字节从不过 content 重组，彻底规避 v1.1.x「分块 relay 到 content 丢块→错位损坏」问题。
 async function ensureOffscreen() {
   if (!chrome.offscreen) throw new Error('当前 Chrome 版本不支持 offscreen（需 ≥109）');
   try {
@@ -266,5 +359,5 @@ async function ensureOffscreen() {
   });
 }
 
-// ---- 落盘中转：offscreen 现已改为经 sendMessage(type:'bili-dl-save') 把字节发来，由 SW 转投
-// content script 静默直写（见 onMessage 中的 'bili-dl-save' 分支）。旧的 port 长连接落盘逻辑已弃用。 ----
+// ---- 落盘说明：offscreen 经 port 长连接('bili-dl-save') 把字节发来，见下方 onConnect 处理；
+// onMessage 中不再保留 'bili-dl-save' 分支（已被 port 长连接取代）。 ----

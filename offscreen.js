@@ -3,12 +3,14 @@
  * 设计要点（与上一版 wrapper 方案的根本区别）：
  *  1. 取流 m4s 与 ffmpeg 合并/转码在本 Offscreen 文档内完成（扩展 host_permissions 让
  *     跨源 fetch 响应体可读；Emscripten ccall('main') 主线程驱动）。
- *  2. 落盘经 SW 中转回 content：chrome.downloads API 在 Chrome MV3 的 Offscreen Document
- *     上下文中不可用（Chrome 文档明确：可用上下文为 background/content/popup/options，
- *     offscreen 不在列表）；而 File System Access API 仅在 window 上下文（content/popup）
- *     可用、SW 内也不可用。因此 offscreen 把合并好的字节通过
- *     chrome.runtime.sendMessage({ type:'bili-dl-save' }) 经 SW 中转回视频页 content，
- *     由 content 决定走 File System Access 静默直写（不弹下载栏）或回退 chrome.downloads。
+ *  2. 落盘经 SW 长连接（transferable ArrayBuffer 分块）：chrome.downloads API 在 Chrome MV3 的
+ *     Offscreen Document 上下文中不可用（Chrome 文档明确：可用上下文为
+ *     background/content/popup/options，offscreen 不在列表）；而 File System Access API
+ *     仅在 window 上下文（content/popup）可用、SW 内也不可用。因此 offscreen 合并完每个文件后，
+ *     开一条 chrome.runtime.connect('bili-dl-save') 长连接，把字节用 transferable ArrayBuffer
+ *     直接发回 SW（不经过 content 重组，绝不会因多跳中转丢块）。SW 收齐后：默认直接
+ *     chrome.downloads.download（字节绝对精确）；静默模式把字节写入 IndexedDB 中转给 content
+ *     走 File System Access 直写目录（不弹下载栏）。
  *  3. ffmpeg-core 用 @ffmpeg/core@0.11.0 的 Emscripten 工厂（顶部 var createFFmpegCore
  *     已挂全局）。本扩展不设 COOP/COEP -> SharedArrayBuffer 不可用 -> Emscripten 自动
  *     回退单线程，不派生 Worker，故 CSP 无需放行 blob Worker。
@@ -126,44 +128,53 @@ async function fetchToUint8(url, onProgress) {
   return out;
 }
 
-// ---- 落盘：把字节按 8MB 分块经 SW 中转回 content script，由 content 重组后决定走
-//      File System Access（静默）还是下载 API ----
-// 关键架构决策：chrome.downloads API 在 Chrome MV3 的 Offscreen Document 上下文中不可用
-// （Chrome 文档明确：可用上下文为 background/content/popup/options，offscreen 不在列表）；
-// 而 File System Access API 仅在 window 上下文（content/popup）可用、SW 内也不可用。
-// 现把合并好的字节（Uint8Array）按 8MB 切块，通过 sendMessage（type:'bili-dl-save-chunk'）
-// 经 SW 中转回视频页 content script，由 content 在「静默模式」下用 File System Access API
-// 直接写目录（完全不弹下载栏）；不支持 FS API 时回退到 chrome.downloads.download。
-// 必须分块：扩展消息有体积上限（约 64MB），把整段视频一次性塞进单条 sendMessage 会超限失败，
-// 之前「整包发送」正是大视频无法保存的根因。
-async function saveBlob(uint8, filename, saveAs, conflictAction, reqId) {
-  const CHUNK = 8 * 1024 * 1024; // 8MB/块，远低于扩展消息体积上限
+async function saveBlob(uint8, filename, saveAs, conflictAction, reqId, silent, cid) {
+  const CHUNK = 8 * 1024 * 1024; // 8MB/块（transferable ArrayBuffer，单次发送远低于扩展消息体积上限）
   const totalSize = uint8.length;
   const fileId = 'f' + Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
-  const meta = { reqId: reqId || null, filename, conflictAction: conflictAction || 'uniquify', saveAs: !!saveAs };
-  let index = 0;
-  for (let offset = 0; offset < totalSize; offset += CHUNK) {
-    const slice = uint8.subarray(offset, Math.min(offset + CHUNK, totalSize));
-    const standalone = slice.slice(); // 复制出独立 buffer，便于结构化克隆安全传输
-    try {
-      chrome.runtime.sendMessage({
-        type: 'bili-dl-save-chunk', fileId, index, offset, totalSize, chunk: standalone, ...meta
-      }, () => {
-        // 火与忘：SW 中转给 content 后不会主动 sendResponse，
-        // 若这里 await callback 会被挂起到 chrome.runtime.lastError 1 分钟超时后 reject。
-        // 真正落盘成败由 content 监听 chunk/final 自行处理并在 UI 报告。
-        if (chrome.runtime.lastError) { /* SW 兜底会以 relayedCount===0 自行落盘 */ }
-      });
-    } catch (e) { console.warn('[bili-dl] 分块发送异常 idx=' + index, e); }
-    index++;
-    // 让出主线程：避免大批量分块同步占满事件循环、给 SW/content 接收与落盘留时间
-    await new Promise(r => setTimeout(r, 0));
-  }
-  try {
-    chrome.runtime.sendMessage({ type: 'bili-dl-save-final', fileId, totalSize, ...meta }, () => {
-      if (chrome.runtime.lastError) { /* noop */ }
+  return new Promise((resolve, reject) => {
+    let port;
+    try { port = chrome.runtime.connect({ name: 'bili-dl-save' }); }
+    catch (e) { reject(new Error('无法连接落盘通道：' + String(e.message || e))); return; }
+    let finished = false;
+    port.onMessage.addListener((m) => {
+      if (m.type === 'ready') {
+        let offset = 0, index = 0;
+        const sendNext = () => {
+          if (offset >= totalSize) {
+            try { port.postMessage({ type: 'final', fileId }); } catch (_) {}
+            return;
+          }
+          const slice = uint8.subarray(offset, Math.min(offset + CHUNK, totalSize));
+          const standalone = slice.slice(); // 独立 buffer 才能 transferable
+          try { port.postMessage({ type: 'chunk', index, buffer: standalone.buffer }, [standalone.buffer]); }
+          catch (e) { if (!finished) { finished = true; port.disconnect(); reject(new Error('分块发送失败：' + String(e.message || e))); } return; }
+          offset += CHUNK; index++;
+          if (offset < totalSize) setTimeout(sendNext, 0);
+          else sendNext();
+        };
+        sendNext();
+      } else if (m.type === 'done') {
+        finished = true; port.disconnect();
+        resolve({ filename: m.filename, fallback: m.fallback });
+      } else if (m.type === 'error') {
+        finished = true; port.disconnect();
+        reject(new Error(m.error || '落盘失败'));
+      }
     });
-  } catch (e) { console.warn('[bili-dl] 收尾发送异常', e); }
+    port.onDisconnect.addListener(() => {
+      if (!finished) reject(new Error('落盘通道已断开（SW 可能未启动或被 Chrome 重启）'));
+    });
+    try {
+      port.postMessage({
+        type: 'init', fileId,
+        filename, saveAs: !!saveAs,
+        conflictAction: conflictAction || 'uniquify',
+        silent: !!silent,
+        totalSize, reqId: reqId || null, cid: (typeof cid === 'number') ? cid : null
+      });
+    } catch (e) { if (!finished) { finished = true; port.disconnect(); reject(new Error('启动落盘通道失败：' + String(e.message || e))); } }
+  });
 }
 
 // ---- 下载子目录清洗（防御式：Chrome 仅允许“下载”目录下的相对路径）----
@@ -214,7 +225,7 @@ function buildFileName(job, nf) {
 }
 
 // ---- 单个 job 处理 ----
-async function processJob(core, job, report, nameFormat, dir, saveAs, conflictAction, reqId) {
+async function processJob(core, job, report, nameFormat, dir, saveAs, conflictAction, reqId, silent) {
   const nf = nameFormat || { title: true, pn: true, part: true, qn: true };
   try {
     if (job.kind === 'durl') {
@@ -236,7 +247,7 @@ async function processJob(core, job, report, nameFormat, dir, saveAs, conflictAc
         outBytes = core.FS.readFile('out.mp4');
       }
       const name = withDir(`${buildFileName(job, nf)}.mp4`, dir);
-      await saveBlob(new Uint8Array(outBytes), name, saveAs, conflictAction, reqId);
+      await saveBlob(new Uint8Array(outBytes), name, saveAs, conflictAction, reqId, silent, job.cid);
       report('fetch', 1.0);
       return { filename: name };
     }
@@ -268,7 +279,7 @@ async function processJob(core, job, report, nameFormat, dir, saveAs, conflictAc
       }
       const out = core.FS.readFile(outName);
       const name = withDir(`${buildFileName(job, nf)}.${ext}`, dir);
-      await saveBlob(new Uint8Array(out), name, saveAs, conflictAction, reqId);
+      await saveBlob(new Uint8Array(out), name, saveAs, conflictAction, reqId, silent, job.cid);
       report('fetch', 1.0);
       return { filename: name };
     }
@@ -308,7 +319,7 @@ async function processJob(core, job, report, nameFormat, dir, saveAs, conflictAc
       } catch (_) { out = null; }
     }
     const name = withDir(`${buildFileName(job, nf)}.mp4`, dir);
-    await saveBlob(new Uint8Array(out), name, saveAs, conflictAction, reqId);
+    await saveBlob(new Uint8Array(out), name, saveAs, conflictAction, reqId, silent, job.cid);
     report('fetch', 1.0);
     return { filename: name };
   } finally {
@@ -348,6 +359,7 @@ async function handleTask(msg) {
   // 并发路数：1=单文件依次（最稳，避免批量时卡顿），≥2=多线程提速（默认 3，由 content 设置传入）
   const concurrency = (typeof msg.concurrency === 'number' && msg.concurrency >= 1 && msg.concurrency <= 6)
     ? Math.floor(msg.concurrency) : 3;
+  const silent = (msg.silent === true);
   const total = jobs.length;
   const results = new Array(total);
 
@@ -382,7 +394,7 @@ async function handleTask(msg) {
         } catch (_) {}
       };
       try {
-        const r = await processJob(core, job, report, nameFormat, dir, saveAs, conflictAction, reqId);
+        const r = await processJob(core, job, report, nameFormat, dir, saveAs, conflictAction, reqId, silent);
         results[i] = { ok: true, filename: r.filename, fallback: r.fallback, cid: (job && typeof job.cid === 'number') ? job.cid : undefined };
         report('done', 1);
       } catch (e) {

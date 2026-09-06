@@ -189,7 +189,6 @@
   // 分块落盘累积表：fileId -> { meta, chunks:Map<index,Uint8Array>, totalSize }
   // offscreen 把合并好的字节按 8MB 切块经 SW 中转回 content，content 在此重组后静默直写，
   // 避免「整包字节一次性 sendMessage」超出扩展消息体积上限导致大视频落盘失败。
-  const pendingWrites = new Map();
   // 任务已完成（bili-dl-done 已到）—— 之后到达的 bili-dl-progress 不再写 status/bar，
   // 避免 SW 中转的 chrome.tabs.query 并发回调乱序导致「done 之后又收到 phase=save 的
   // progress 把状态覆盖回『保存中』」。下一次 dispatchTask 调用时重置为 false。
@@ -266,6 +265,15 @@
       tx.onerror = () => rej(tx.error);
     });
   }
+  async function idbDelete(k) {
+    const db = await idbOpen();
+    return new Promise((res, rej) => {
+      const tx = db.transaction('kv', 'readwrite');
+      tx.objectStore('kv').delete(k);
+      tx.oncomplete = () => res();
+      tx.onerror = () => rej(tx.error);
+    });
+  }
   // 在用户手势内（点下载按钮时）确保已拿到目录句柄；返回后 fsDirHandle 即用
   async function prepareSilentHandle() {
     if (!window.showDirectoryPicker) return; // 环境不支持 FS API → 走下载 API 兜底
@@ -328,62 +336,42 @@
     return (v >= 1 && v <= 6) ? v : 3;
   }
   // 接收 offscreen 经 SW 中转回的分块字节，按 fileId 重组后落盘
-  async function handleSaveRelay(msg) {
-    const fid = msg.fileId;
-    if (!pendingWrites.has(fid)) {
-      pendingWrites.set(fid, {
-        meta: { filename: msg.filename, conflictAction: msg.conflictAction, saveAs: msg.saveAs },
-        chunks: new Map(), totalSize: msg.totalSize || 0
-      });
-    }
-    const entry = pendingWrites.get(fid);
-    if (msg.type === 'bili-dl-save-chunk') {
-      entry.chunks.set(msg.index, new Uint8Array(msg.chunk));
+  // 接收 SW 经 IndexedDB 中转的落盘指令：从 IndexedDB 取出字节后落盘
+  // （静默模式走 File System Access 直写目录，否则回退 chrome.downloads.download）。
+  // 字节由 SW 直接写入 IndexedDB，content 只负责「取出→写入」，不经过任何分块重组，
+  // 因此不再有 v1.1.x「分块经 SW relay 到 content 丢块→错位损坏」的问题。
+  async function handleSilentWrite(msg) {
+    const fname = msg.filename;
+    const cid = (msg && typeof msg.cid !== 'undefined') ? msg.cid : null;
+    const bytes = await idbGet('bili-save-' + msg.fileId).catch(() => null);
+    await idbDelete('bili-save-' + msg.fileId).catch(() => {});
+    if (!bytes) {
+      const err = '未取得文件字节（IndexedDB 中转失败）：' + fname;
+      console.warn('[bili-dl]', err); setStatus('⚠️ ' + err);
+      batchFail++;
+      if (cid != null) { failErrors.set(cid, err); markRow(cid, 'fail'); }
       return;
     }
-    // bili-dl-save-final：拼装全部分块后落盘，并把结果显式上报（成功/失败都报）
-    const total = entry.totalSize || 0;
-    const out = new Uint8Array(total);
-    let pos = 0;
-    let miss = 0;
-    Array.from(entry.chunks.keys()).sort((a, b) => a - b).forEach(i => {
-      const c = entry.chunks.get(i);
-      if (!c) { miss++; return; }
-      out.set(c, pos); pos += c.length;
-    });
-    pendingWrites.delete(fid);
-    const fname = entry.meta.filename;
-    const finalCid = entry.meta && entry.meta.cid;
-    if (miss > 0) {
-      console.warn('[bili-dl] ' + fname + ' 缺 ' + miss + ' 块，已尽力写出');
-      setStatus('⚠️ ' + fname + ' 缺 ' + miss + ' 块，文件可能不完整');
-    }
-    const r = await writeFileSilent(fname, out);
-    if (!r || !r.ok) {
-      batchFail++;
-      if (finalCid != null) {
-        failErrors.set(finalCid, (r && r.error) || '落盘失败');
-        markRow(finalCid, 'fail');
-      }
-    } else {
+    const r = await writeFileSilent(fname, (bytes instanceof Uint8Array) ? bytes : new Uint8Array(bytes));
+    if (r && r.ok) {
       batchDone++;
-      if (finalCid != null) markRow(finalCid, 'ok');
+      if (cid != null) markRow(cid, 'ok');
       tryLocalDone();
+    } else {
+      batchFail++;
+      const err = (r && r.error) || '落盘失败';
+      if (cid != null) { failErrors.set(cid, err); markRow(cid, 'fail'); }
     }
   }
 
-  // 调试：console 运行 window.biliStatus() 查看 fsDirHandle / pendingWrites / batch 状态
+  // 调试：console 运行 window.biliStatus() 查看 fsDirHandle / batch 状态
   window.biliStatus = function () {
-    const pending = [];
-    pendingWrites.forEach((v, k) => pending.push({ fileId: k, received: v.chunks.size, totalSize: v.totalSize, filename: v.meta.filename }));
     return {
       hasFsDirHandle: !!fsDirHandle,
       fsApiSupported: !!window.showDirectoryPicker,
       silentSetting: getSilent && getSilent(),
       concurrency: getConcurrency(),
       currentReqId,
-      pendingWritesCount: pendingWrites.size,
-      pendingWrites: pending,
       batchRunning,
       batchDone,
       batchFail
@@ -500,7 +488,8 @@
       dir: (typeof dir === 'string') ? dir : getDir(),
       saveAs: (typeof saveAs === 'boolean') ? saveAs : getSaveAs(),
       conflictAction: (typeof conflictAction === 'string') ? conflictAction : getConflictAction(),
-      concurrency: (typeof concurrency === 'number') ? concurrency : getConcurrency()
+      concurrency: (typeof concurrency === 'number') ? concurrency : getConcurrency(),
+      silent: getSilent()
     });
     armBatchTimeout(); // 兜底：5 分钟未收到 done 时强制复位
   }
@@ -632,10 +621,10 @@
         // 用户看到的反馈就是各分P 行内色块横向填充，单行完成立即变深绿 + ✓，
         // 全部完成时才闪一次底部状态条 + Toast。
         onBatchProgress(msg);
-      } else if ((msg.type === 'bili-dl-save-chunk' || msg.type === 'bili-dl-save-final') && msg.reqId === currentReqId) {
-        // offscreen 把合并好的字节按 8MB 分块经 SW 中转回 content，由 content 重组后落盘：
+      } else if (msg.type === 'bili-dl-write' && msg.reqId === currentReqId) {
+        // SW 已把合并好的字节写入 IndexedDB 中转；content 取出后落盘：
         // 静默模式走 File System Access API 直接写目录（无下载栏），否则回退下载 API。
-        handleSaveRelay(msg).catch(e => console.warn('[bili-dl] 落盘接收失败', e));
+        handleSilentWrite(msg).catch(e => console.warn('[bili-dl] 落盘接收失败', e));
       } else if (msg.type === 'bili-dl-done' && msg.reqId === currentReqId) {
         // 【本地真相源】tryLocalDone() 可能已先行触发（按 progress 自动复位）。
         // 如果已经触发过，done 仅用作 success/fallback 统计补全，不重复写文案。
