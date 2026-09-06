@@ -1,6 +1,6 @@
 {
-  "version": "1.1.0",
+  "version": "1.1.1",
   "release_url": "https://github.com/my788525/bili-dl-ext/releases/latest",
   "min_chrome": "110",
-  "notes": "新增静默下载（File System Access API 直接写目录，不弹浏览器下载栏，杜绝批量时卡顿/逐文件弹窗）；新增并发下载设置（单文件依次 1 路 / 多线程 2-6 路，默认 3 路，可切到单文件依次排查卡顿）；完成自动去勾、深绿完成态、汇总通知保持不变。"
+  "notes": "修复静默下载「大视频无法保存」：落盘链路由「整包字节一次性 sendMessage」改为「8MB 分块流式传回 content 重组后再静默直写」，规避扩展消息体积上限；无 bilibili 标签页时仍由 SW 用下载 API 兜底。对齐 manifest.json 版本号（此前 version.json 与 manifest 不一致会导致版本检测误报）。"
 }

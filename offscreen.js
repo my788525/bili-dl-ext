@@ -3,11 +3,12 @@
  * 设计要点（与上一版 wrapper 方案的根本区别）：
  *  1. 取流 m4s 与 ffmpeg 合并/转码在本 Offscreen 文档内完成（扩展 host_permissions 让
  *     跨源 fetch 响应体可读；Emscripten ccall('main') 主线程驱动）。
- *  2. 落盘必须经 SW：chrome.downloads API 在 Chrome MV3 的 Offscreen Document 上下文中
- *     不可用（Chrome 文档明确：可用上下文为 background/content/popup/options，offscreen
- *     不在列表）。offscreen 通过 chrome.runtime.connect('bili-dl-save') 开长连接，把
- *     Uint8Array 用 transferable ArrayBuffer 分块转给 SW，SW 拼成 base64 data URL 后调
- *     chrome.downloads.download 落盘（Chrome 78+ 自动建子目录）。
+ *  2. 落盘经 SW 中转回 content：chrome.downloads API 在 Chrome MV3 的 Offscreen Document
+ *     上下文中不可用（Chrome 文档明确：可用上下文为 background/content/popup/options，
+ *     offscreen 不在列表）；而 File System Access API 仅在 window 上下文（content/popup）
+ *     可用、SW 内也不可用。因此 offscreen 把合并好的字节通过
+ *     chrome.runtime.sendMessage({ type:'bili-dl-save' }) 经 SW 中转回视频页 content，
+ *     由 content 决定走 File System Access 静默直写（不弹下载栏）或回退 chrome.downloads。
  *  3. ffmpeg-core 用 @ffmpeg/core@0.11.0 的 Emscripten 工厂（顶部 var createFFmpegCore
  *     已挂全局）。本扩展不设 COOP/COEP -> SharedArrayBuffer 不可用 -> Emscripten 自动
  *     回退单线程，不派生 Worker，故 CSP 无需放行 blob Worker。
@@ -110,23 +111,38 @@ async function fetchToUint8(url, onProgress) {
   return out;
 }
 
-// ---- 落盘：把字节经 SW 中转回 content script，由 content 决定走 File System Access（静默）还是下载 API ----
+// ---- 落盘：把字节按 8MB 分块经 SW 中转回 content script，由 content 重组后决定走
+//      File System Access（静默）还是下载 API ----
 // 关键架构决策：chrome.downloads API 在 Chrome MV3 的 Offscreen Document 上下文中不可用
-// （Chrome 文档明确：可用上下文为 background/content/popup/options，offscreen 不在列表）。
-// 之前用 port 把字节转给 SW 再由 SW 调 chrome.downloads.download，但那样每文件都会弹下载栏，
-// 批量时浏览器像“卡住”。现改为把合并好的字节（Uint8Array）通过 sendMessage 经 SW 中转回
-// 视频页 content script，由 content 在「静默模式」下用 File System Access API 直接写目录
-// （完全不弹下载栏）；不支持 FS API 时回退到 chrome.downloads.download。
+// （Chrome 文档明确：可用上下文为 background/content/popup/options，offscreen 不在列表）；
+// 而 File System Access API 仅在 window 上下文（content/popup）可用、SW 内也不可用。
+// 现把合并好的字节（Uint8Array）按 8MB 切块，通过 sendMessage（type:'bili-dl-save-chunk'）
+// 经 SW 中转回视频页 content script，由 content 在「静默模式」下用 File System Access API
+// 直接写目录（完全不弹下载栏）；不支持 FS API 时回退到 chrome.downloads.download。
+// 必须分块：扩展消息有体积上限（约 64MB），把整段视频一次性塞进单条 sendMessage 会超限失败，
+// 之前「整包发送」正是大视频无法保存的根因。
 async function saveBlob(uint8, filename, saveAs, conflictAction, reqId) {
+  const CHUNK = 8 * 1024 * 1024; // 8MB/块，远低于扩展消息体积上限
+  const totalSize = uint8.length;
+  const fileId = 'f' + Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
+  const meta = { reqId: reqId || null, filename, conflictAction: conflictAction || 'uniquify', saveAs: !!saveAs };
+  let index = 0;
+  for (let offset = 0; offset < totalSize; offset += CHUNK) {
+    const slice = uint8.subarray(offset, Math.min(offset + CHUNK, totalSize));
+    const standalone = slice.slice(); // 复制出独立 buffer，便于结构化克隆安全传输
+    await new Promise((resolve, reject) => {
+      chrome.runtime.sendMessage({
+        type: 'bili-dl-save-chunk', fileId, index, offset, totalSize, chunk: standalone, ...meta
+      }, () => {
+        if (chrome.runtime.lastError) reject(new Error(chrome.runtime.lastError.message || '落盘分块发送失败'));
+        else resolve();
+      });
+    });
+    index++;
+  }
   await new Promise((resolve, reject) => {
-    chrome.runtime.sendMessage({
-      type: 'bili-dl-save',
-      reqId: reqId || null,
-      filename,
-      conflictAction: conflictAction || 'uniquify',
-      bytes: uint8
-    }, () => {
-      if (chrome.runtime.lastError) reject(new Error(chrome.runtime.lastError.message || '落盘中转失败'));
+    chrome.runtime.sendMessage({ type: 'bili-dl-save-final', fileId, totalSize, ...meta }, () => {
+      if (chrome.runtime.lastError) reject(new Error(chrome.runtime.lastError.message || '落盘收尾发送失败'));
       else resolve();
     });
   });

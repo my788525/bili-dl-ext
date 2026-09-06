@@ -134,6 +134,8 @@ chrome.runtime.onInstalled.addListener(async () => {
 let biliTabsCache = null;
 let biliTabsCacheTS = 0;
 const BILI_TABS_TTL = 3000;
+// 分块落盘兜底累积表：fileId -> [{index,chunk}]，仅当无 bili 标签页（relay 失败）时由 SW 拼装写出
+const swAccumSaves = new Map();
 async function getBiliTabs() {
   const now = Date.now();
   if (biliTabsCache && (now - biliTabsCacheTS < BILI_TABS_TTL)) return biliTabsCache;
@@ -146,10 +148,12 @@ async function relayToBiliTabs(msg) {
   let tabs;
   try { tabs = await getBiliTabs(); }
   catch (_) { tabs = []; }
+  const valid = (tabs || []).filter(t => t && t.id != null);
   // 关键：chrome.tabs.sendMessage 是返回 Promise 的异步 IPC，但之前 forEach fire-and-forget
   // 让 SW listener 立刻返回 false，Chrome 允许 SW 立即休眠——sendMessage 可能被 OS 截断。
   // 现在用 Promise.all 等所有 sendMessage 完成，并让 listener return true 保持 SW 唤醒。
-  await Promise.all((tabs || []).map(t => chrome.tabs.sendMessage(t.id, msg).catch(() => {})));
+  await Promise.all(valid.map(t => chrome.tabs.sendMessage(t.id, msg).catch(() => {})));
+  return valid.length; // 实际送达的标签页数量（0 = 无 bili 标签页，需 SW 兜底落盘）
 }
 
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
@@ -218,18 +222,32 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   // 落盘中转：offscreen 把合并好的字节发来，由 SW 转投到视频页 content script 静默直写
   // （File System Access API 仅在页面/扩展窗口上下文可用，SW 内不可用，故必须绕到 content）。
   // 若中转失败（如 content 未注入），则 SW 自身用 chrome.downloads.download 兜底落盘。
-  if (msg.type === 'bili-dl-save') {
+  if (msg.type === 'bili-dl-save' || msg.type === 'bili-dl-save-chunk' || msg.type === 'bili-dl-save-final') {
     (async () => {
-      let relayed = false;
-      try { await relayToBiliTabs(msg); relayed = true; } catch (_) {}
-      if (!relayed) {
-        try {
-          const blob = new Blob([msg.bytes]);
-          const url = URL.createObjectURL(blob);
-          await chrome.downloads.download({ url, filename: msg.filename, saveAs: false, conflictAction: msg.conflictAction || 'uniquify' });
-          setTimeout(() => URL.revokeObjectURL(url), 2000);
-        } catch (e) { console.warn('[bili-dl] 落盘兜底失败', e); }
+      let relayedCount = 0;
+      try { relayedCount = await relayToBiliTabs(msg); } catch (_) {}
+      if (relayedCount === 0) {
+        // 没有 bili 标签页 / content 未注入：由 SW 自身用下载 API 落盘（仅 final 时拼装写出）
+        if (msg.type === 'bili-dl-save-chunk') {
+          let arr = swAccumSaves.get(msg.fileId);
+          if (!arr) { arr = []; swAccumSaves.set(msg.fileId, arr); }
+          arr.push({ index: msg.index, chunk: msg.chunk });
+        } else if (msg.type === 'bili-dl-save-final') {
+          const pieces = swAccumSaves.get(msg.fileId) || [];
+          const total = msg.totalSize || 0;
+          const out = new Uint8Array(total);
+          let pos = 0;
+          pieces.sort((a, b) => a.index - b.index).forEach(p => { out.set(new Uint8Array(p.chunk), pos); pos += p.chunk.length; });
+          swAccumSaves.delete(msg.fileId);
+          try {
+            const blob = new Blob([out]);
+            const url = URL.createObjectURL(blob);
+            await chrome.downloads.download({ url, filename: msg.filename, saveAs: false, conflictAction: msg.conflictAction || 'uniquify' });
+            setTimeout(() => URL.revokeObjectURL(url), 2000);
+          } catch (e) { console.warn('[bili-dl] 落盘兜底失败', e); }
+        }
       }
+      // 中转成功时无需 SW 保留字节（content 已接收并写出）；原整包 'bili-dl-save' 类型已弃用
       try { sendResponse({ ok: true }); } catch (_) {}
     })();
     return true; // 异步
@@ -242,9 +260,10 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 // ffmpeg 合并/转码放到扩展同源 Offscreen Document 的「主线程」执行（Chrome 109+）。
 // offscreen.html 用 <script> 注入 ffmpeg-core.js（顶部 var createFFmpegCore 已挂全局），
 // 由 offscreen.js 直接 ccall('main') 驱动。整条流水线（取流→ffmpeg 合并/转码→落盘），
-// 取流/合并在 offscreen 内完成；落盘由 offscreen 经长连接（port 'bili-dl-save'）把
-// Uint8Array 用 transferable ArrayBuffer 转给 SW，SW 调 chrome.downloads.download 写盘
-// （因 chrome.downloads 在 offscreen 上下文中不可用）。
+// 取流/合并在 offscreen 内完成；落盘由 offscreen 把合并好的字节按 8MB 分块经
+// sendMessage({type:'bili-dl-save-chunk'/'-final'}) 发来，SW 中转回视频页 content 静默直写
+// （File System Access API 只在页面/扩展窗口上下文可用，offscreen 与 SW 内均不可用；
+// 故必须绕到 content 落盘；分块是为规避扩展消息体积上限，避免大视频整包发送超限失败）。
 async function ensureOffscreen() {
   if (!chrome.offscreen) throw new Error('当前 Chrome 版本不支持 offscreen（需 ≥109）');
   try {
