@@ -238,8 +238,8 @@
   // ---------- 落盘说明（v1.1.8 起）----------
   // 合并后的字节在 Offscreen 文档内用 `new Blob([bytes])` → `URL.createObjectURL` →
   // `chrome.downloads.download` 直接落盘：字节零损耗、无大小限制（blob: URL 不受 data:URL 的 MB 级上限约束）。
-  // 「静默下载」开关 = saveAs:false（不弹“另存为”，直接写入 Chrome 默认「下载」文件夹下的子目录，
-  // 子目录由面板输入框指定）；关闭静默 + 勾选「另存为」= saveAs:true（保存时弹系统对话框选任意真实文件夹）。
+  // 「静默下载」开关控制弹窗：勾选=saveAs:false（不弹“另存为”，直接写入 Chrome 默认「下载」文件夹下的子目录，
+  // 子目录由面板输入框指定）；不勾选=saveAs:true（每文件弹系统“另存为”对话框选任意真实文件夹）。
   // 该方案为 0.1.0 已验证可播的可靠路径，彻底规避了历史上「端口 relay / IndexedDB 中转 / data:URL 截断」导致的损坏。
   const CONC_KEY = 'bili_dl_concurrency'; // 并发下载路数：1=单文件依次，≥2=多线程
   let fsDirHandle = null; // 已授权的目录句柄（内存缓存）
@@ -352,7 +352,6 @@
   // 文件名格式 & 下载位置 的持久化键
   const FMT_KEY = 'bili_dl_namefmt';
   const DIR_KEY = 'bili_dl_dir';
-  const SAVEAS_KEY = 'bili_dl_saveas';
   // 静默下载（默认开启）：开启时走 File System Access API 直接写目录，不弹浏览器下载栏
   const SILENT_KEY = 'bili_dl_silent';
 
@@ -370,7 +369,7 @@
   }
   // 模块级读取下载位置配置（供 dispatchTask 等模块作用域函数使用，直接查 DOM，避免被 buildUI 局部 const 遮蔽）
   function getDir() { const el = document.getElementById('bili-dl-dir'); return el ? sanitizeDirInput(el.value) : ''; }
-  function getSaveAs() { const el = document.getElementById('bili-dl-saveas'); return el ? el.checked : false; }
+  function getSaveAs() { return false; } // 已废弃：弹窗与否统一由「静默下载」开关决定（非静默=弹“另存为”）
   function getNameFormat() {
     const pick = (id) => { const el = document.getElementById(id); return el ? el.checked : true; };
     return {
@@ -432,8 +431,9 @@
       type: 'bili-dl-task', reqId: currentReqId, jobs,
       nameFormat: nameFormat || getNameFormat(),
       dir: (typeof dir === 'string') ? dir : getDir(),
-      // 静默模式（默认勾选）= 不弹“另存为”对话框（saveAs:false）；关闭静默后由“另存为”勾选框决定
-      saveAs: (typeof saveAs === 'boolean') ? saveAs : (getSilent() ? false : getSaveAs()),
+      // 默认（非静默）弹出浏览器“另存为”下载窗口（saveAs:true）；勾选“静默下载”才不弹窗（saveAs:false）。
+      // 即：静默=关窗直写目录；非静默=弹窗让用户选位置。
+      saveAs: (typeof saveAs === 'boolean') ? saveAs : (!getSilent()),
       conflictAction: (typeof conflictAction === 'string') ? conflictAction : getConflictAction(),
       concurrency: (typeof concurrency === 'number') ? concurrency : getConcurrency(),
       silent: getSilent()
@@ -859,7 +859,7 @@
                 <span class="dir-prefix">下载目录/</span>
                 <input type="text" id="bili-dl-dir" placeholder="例如 Bilibili/Videos" spellcheck="false" autocomplete="off">
               </div>
-              <label class="dir-saveas"><input type="checkbox" id="bili-dl-saveas"> 下载时弹出系统“另存为”对话框（可选任意真实文件夹；批量时会逐文件弹出）</label>
+              <div class="dir-saveas dir-note">提示：不勾选「静默下载」时，每个文件都会弹出系统“另存为”对话框；批量下载请勾选「静默下载」以避免逐文件弹窗。</div>
               <div class="dir-note" id="bili-dl-dir-note"></div>
             </div>
             <div class="bili-dl-extra">
@@ -867,7 +867,7 @@
               <label class="extra-chk"><input type="checkbox" id="bili-dl-aux-sub"> 字幕</label>
               <label class="extra-chk"><input type="checkbox" id="bili-dl-aux-dm"> 弹幕</label>
               <label class="extra-chk"><input type="checkbox" id="bili-dl-aux-cover"> 封面</label>
-              <label class="extra-chk" style="width:100%"><input type="checkbox" id="bili-dl-silent" checked> 静默下载（推荐·不走浏览器下载栏，直接写目录）</label>
+              <label class="extra-chk" style="width:100%"><input type="checkbox" id="bili-dl-silent"> 静默下载（勾选后不走浏览器下载栏、不弹“另存为”窗口，直接写目录；不勾选则每文件弹系统“另存为”对话框）</label>
               <button type="button" id="bili-dl-change-dir" class="bili-dl-changedir">🗑️ 清空子目录</button>
               <div id="bili-dl-dir-label" class="bili-dl-dir-label">下载位置：下载目录/（根目录）</div>
               <div class="bili-dl-conflict">
@@ -915,7 +915,7 @@
     const selftestBtn = $('#bili-dl-selftest');
     const fmtTitle = $('#bili-dl-fmt-title'), fmtPn = $('#bili-dl-fmt-pn');
     const fmtPart = $('#bili-dl-fmt-part'), fmtQn = $('#bili-dl-fmt-qn');
-    const dirInput = $('#bili-dl-dir'), saveasCb = $('#bili-dl-saveas'), dirNote = $('#bili-dl-dir-note');
+    const dirInput = $('#bili-dl-dir'), dirNote = $('#bili-dl-dir-note');
 
     // 文件名格式持久化：跨页面/刷新保留勾选
     const saveFmt = () => chrome.storage.local.set({
@@ -934,11 +934,10 @@
       cb.onchange = () => { saveFmt(); if (ctx && !batchRunning) renderList(); updateFmtPreview(); };
     });
 
-    // 下载位置持久化：子目录 + 是否弹系统对话框（getDir/getSaveAs 为模块级函数，直接查 DOM）
-    const saveDir = () => chrome.storage.local.set({ [DIR_KEY]: dirInput.value.trim(), [SAVEAS_KEY]: saveasCb.checked });
-    chrome.storage.local.get([DIR_KEY, SAVEAS_KEY], (s) => {
+    // 下载位置持久化：子目录（是否弹系统“另存为”对话框由“静默下载”开关决定，见 dispatchTask）
+    const saveDir = () => chrome.storage.local.set({ [DIR_KEY]: dirInput.value.trim() });
+    chrome.storage.local.get([DIR_KEY], (s) => {
       if (s && typeof s[DIR_KEY] === 'string') dirInput.value = s[DIR_KEY];
-      if (s && typeof s[SAVEAS_KEY] === 'boolean') saveasCb.checked = s[SAVEAS_KEY];
     });
     dirInput.oninput = () => {
       const cleaned = sanitizeDirInput(dirInput.value);
@@ -950,8 +949,6 @@
       saveDir();
       updateFmtPreview();
     };
-    saveasCb.onchange = () => { saveDir(); if (ctx) renderList(); };
-
     // 静默下载 / 并发路数：持久化跨页面保留
     const silentCb = $('#bili-dl-silent'), concSel = $('#bili-dl-conc');
     const saveSilent = () => chrome.storage.local.set({ [SILENT_KEY]: silentCb.checked, [CONC_KEY]: parseInt(concSel.value, 10) || 3 });
@@ -962,9 +959,9 @@
     silentCb.onchange = saveSilent;
     concSel.onchange = saveSilent;
 
-    // 下载落盘位置说明（v1.1.8 起）：「静默下载」= saveAs:false，文件由 offscreen 内 Blob 直接写入
-    // Chrome 默认「下载」文件夹下的子目录（子目录 = 下方输入框，留空即根目录）；「另存为」开关 = saveAs:true，
-    // 保存时弹系统对话框可选任意真实文件夹。Chrome 扩展在 offscreen 内无法调用 showDirectoryPicker 自定根目录，
+    // 下载落盘位置说明（v1.1.9 起）：默认不勾选「静默下载」= 每文件弹系统“另存为”窗口（saveAs:true，可选任意真实文件夹）；
+    // 勾选「静默下载」= saveAs:false，文件由 offscreen 内 Blob 直接写入 Chrome 默认「下载」文件夹下的子目录
+    // （子目录 = 下方输入框，留空即根目录）。Chrome 扩展在 offscreen 内无法调用 showDirectoryPicker 自定根目录，
     // 故采用 0.1.0 已验证可播的方案：offscreen 内 Blob → chrome.downloads.download，字节零损耗、无大小限制。
     const changeDirBtn = document.getElementById('bili-dl-change-dir');
     const dirLabel = document.getElementById('bili-dl-dir-label');
