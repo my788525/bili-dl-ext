@@ -36,6 +36,22 @@
 
 ---
 
+## 📸 截图 / Screenshots
+
+<p align="center">
+  <img src="docs/screenshots/panel-batch-download.jpg" width="32%" alt="批量下载面板：行内浅绿进度 + 深绿完成态 + 白色 ✓"/>
+  <img src="docs/screenshots/panel-filename-format.png" width="32%" alt="文件名格式自定义：4 元素勾选组合 + 实时示例预览"/>
+  <img src="docs/screenshots/panel-download-settings.png" width="32%" alt="下载设置：子目录 / 去重 / 字幕弹幕封面 / 冲突策略 / 本地 ffmpeg 测试"/>
+</p>
+
+<p align="center">
+  <em>① 多 P 批量下载（每行独立进度，不阻塞、不卡 99%）</em><br>
+  <em>② 自定义文件名（标题 / PN / 选集名称 / 清晰度 自由勾选）</em><br>
+  <em>③ 下载位置 / 去重 / 字幕·弹幕·封面 / 冲突策略</em>
+</p>
+
+---
+
 ## 支持的浏览器
 
 | 浏览器 | 内核 | 推荐安装方式 | 备注 |
