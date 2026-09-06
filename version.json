@@ -1,6 +1,6 @@
 {
-  "version": "1.1.6",
+  "version": "1.1.7",
   "release_url": "https://github.com/my788525/bili-dl-ext/releases/latest",
   "min_chrome": "110",
-  "notes": "修复静默模式「未取得文件字节（IndexedDB 中转失败）」。根因：IndexedDB 按 origin 隔离——Service Worker 写入的是 chrome-extension:// 扩展 origin，而 content script 读取的是 bilibili.com 页面 origin，两者是不同数据库，content 永远读不到字节。本版彻底弃用 IndexedDB 中转，改为 SW 端口直转：content 在 dispatchTask 时开 bili-dl-sink 端口并向 SW 注册 reqId，SW 把静默文件的字节流(init/chunk/final)透传给 content，由 content 在页面 origin 内重组并走 File System Access API 直写目录（不弹下载栏）。非静默模式不受影响，仍由 SW 直接 chrome.downloads.download。无任何第三方存储中转，字节绝不丢块。"
+  "notes": "修复「下载的视频在 Windows 无法播放」的根因：原 ffmpeg-core 误打包为多线程(@ffmpeg/core)构建，依赖 ffmpeg-core.worker.js + SharedArrayBuffer(COOP/COEP)，而扩展无法提供，导致 ffmpeg worker 初始化失败、合并只产出约 48 字节空文件。已替换为单线程构建 @ffmpeg/core-st@0.11.0，纯主线程 ccall 驱动，合并产出完整的 H.264+AAC 通用 MP4（Windows 默认播放器可播）。此 bug 存在于所有 git 版本（含 v1.0.0），故只有最早用单线程 core 的原型能播。同时保留 v1.1.6 的静默模式端口直转链路。"
 }

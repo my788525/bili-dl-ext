@@ -12,9 +12,11 @@
  *     chrome.downloads.download（字节绝对精确）；静默模式由 SW 把字节流转发给 content 的
  *     bili-dl-sink 端口，content 在页面 origin 内重组并走 File System Access 直写目录
  *     （不弹下载栏）。IndexedDB 因 origin 隔离无法跨 SW/Content 共享，故不采用。
- *  3. ffmpeg-core 用 @ffmpeg/core@0.11.0 的 Emscripten 工厂（顶部 var createFFmpegCore
- *     已挂全局）。本扩展不设 COOP/COEP -> SharedArrayBuffer 不可用 -> Emscripten 自动
- *     回退单线程，不派生 Worker，故 CSP 无需放行 blob Worker。
+ *  3. ffmpeg-core 用 **@ffmpeg/core-st@0.11.0（单线程构建）** 的 Emscripten 工厂（顶部
+ *     var createFFmpegCore 已挂全局）。关键：必须用「单线程」构建——多线程(@ffmpeg/core)构建
+ *     依赖 ffmpeg-core.worker.js + SharedArrayBuffer(COOP/COEP)，而扩展无法提供这些，会导致
+ *     ffmpeg worker 初始化失败、合并产出空文件(仅 48 字节 ftyp)→ Windows 无法播放。单线程构建
+ *     纯主线程 ccall 驱动，无需 Worker/SAB，扩展内稳定可用。
  *  4. m4s 跨源下载：扩展上下文 fetch 不受 CORS 限制；DNR 规则统一注入 Referer 绕过 CDN 防盗链。
  */
 
@@ -32,7 +34,6 @@ const ffmpegCoreFactory = (typeof createFFmpegCore !== 'undefined')
       (self.module.exports.createFFmpegCore || self.module.exports)) || null);
 
 let corePromise = null;
-let coreLog = []; // 收集 ffmpeg printErr（用于探测源编码）
 function ensureCore() {
   if (!ffmpegCoreFactory) {
     return Promise.reject(new Error(

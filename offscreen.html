@@ -4,12 +4,13 @@
   <meta charset="utf-8">
   <title>bili-dl offscreen</title>
   <!--
-    ffmpeg-core.js (@ffmpeg/core@0.11.0) 在文件顶部用 `var createFFmpegCore = (function(){...})()`
-    把工厂函数挂到了全局（window.createFFmpegCore）。其尾部 UMD 的 module/exports/define 分支在
-    扩展上下文不会触发，但顶部的全局 var 始终存在——故无需任何 inline script 垫片（扩展页面 CSP
-    `script-src 'self' 'wasm-unsafe-eval'` 禁止 inline script，否则会直接被拦）。
-    本扩展不设 COOP/COEP -> SharedArrayBuffer 不可用 -> Emscripten 启动时自动回退单线程、
-    不派生 Worker，因此 CSP 无需放行 blob Worker。offscreen.js 直接从全局读取 createFFmpegCore 工厂。
+    ffmpeg-core.js 来自 **@ffmpeg/core-st@0.11.0（单线程构建）**：文件顶部用
+    `var createFFmpegCore = (function(){...})()` 把工厂函数挂到全局（window.createFFmpegCore）。
+    其尾部 UMD 的 module/exports/define 分支在扩展上下文不会触发，但顶部全局 var 始终存在——故无需
+    inline script 垫片（扩展页面 CSP `script-src 'self' 'wasm-unsafe-eval'` 禁止 inline script）。
+    务必使用「单线程(st)」构建：多线程(@ffmpeg/core)构建需 ffmpeg-core.worker.js + SharedArrayBuffer，
+    扩展无法提供 COOP/COEP → worker 初始化失败 → 合并产出空文件 → Windows 无法播放。单线程构建纯主线程
+    ccall 驱动，无需 Worker/SAB。offscreen.js 直接从全局读取 createFFmpegCore 工厂。
   -->
   <script src="ffmpeg-core.js"></script>
 </head>

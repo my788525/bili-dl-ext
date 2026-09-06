@@ -1379,8 +1379,16 @@
           const cb = document.createElement('input');
           cb.type = 'checkbox';
           let checked = ctx.selected.has(page.cid);
-          // 去重：已下载的分P 默认取消勾选并标记（避免重复落盘）
-          if (dedupOn && downloadedCids.has(page.cid)) { checked = false; ctx.selected.delete(page.cid); row.classList.add('is-done'); }
+          // 已下载的分P 仍保持可勾选（默认按 ctx.selected，一般为空即不勾选）；
+          // 用户手动勾选后允许重新下载。仅加 is-done 标记 + “已下载”徽标，不再强制取消勾选。
+          if (downloadedCids.has(page.cid)) {
+            row.classList.add('is-done');
+            const doneTag = document.createElement('span');
+            doneTag.className = 'done-tag';
+            doneTag.textContent = '已下载';
+            doneTag.style.cssText = 'font-size:11px;color:#1a9e57;background:#e7f7ee;border:1px solid #b7e6cd;border-radius:6px;padding:1px 6px;margin-left:4px;';
+            row.appendChild(doneTag);
+          }
           cb.checked = checked;
           const mark = document.createElement('span'); mark.className = 'mark';
           const span = document.createElement('span');
@@ -1415,8 +1423,10 @@
         });
 
         selAllCb.onchange = () => {
-          if (selAllCb.checked) ctx.pages.forEach(p => ctx.selected.add(p.cid));
-          else ctx.selected.clear();
+          if (selAllCb.checked) {
+            // 全选时若开启去重，则跳过已下载分P（避免一键重下全部）；已下载项仍可单独手动勾选重下
+            ctx.pages.forEach(p => { if (!(dedupOn && downloadedCids.has(p.cid))) ctx.selected.add(p.cid); });
+          } else ctx.selected.clear();
           syncRows();
         };
 
@@ -1632,7 +1642,9 @@
         const pageNo = isMulti ? page.page : 0;
         const partName = isMulti ? (page.part || '') : '';
         const label = isMulti ? ('P' + String(pageNo).padStart(2, '0') + (partName ? '_' + safeName(partName) : '')) : '';
-        if (dedupOn && downloadedCids.has(page.cid)) { skipCount++; continue; }
+        // 已下载分P：仅当“未出现在本次手动勾选集合”时才按去重跳过；
+        // 若用户已明确勾选（在 picked 内），则允许重新下载。
+        if (dedupOn && downloadedCids.has(page.cid) && !ctx.selected.has(page.cid)) { skipCount++; continue; }
         try {
           const cls = await getPageStreams(bvid, page);
           if (cls.type === 'durl') {
