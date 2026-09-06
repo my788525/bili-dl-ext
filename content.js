@@ -186,15 +186,10 @@
   let ui = { status: null, bar: null };
   let currentReqId = null;
   let listenerReady = false;
-  // 静默落盘 sink 端口：content 在 dispatchTask 时开 chrome.runtime.connect('bili-dl-sink')
-  // 并向 SW 注册 reqId；SW 把静默文件的字节流（init/chunk/final）透传至本端口，
-  // content 在「页面 origin」内重组并走 File System Access API 直写目录（不弹下载栏）。
-  // 关键：IndexedDB 按 origin 隔离，SW（chrome-extension://）与 content（bilibili.com）无法共享，
-  // 故 v1.1.5 的 IndexedDB 中转方案失效（content 永远读不到字节 → 报「未取得文件字节」）；
-  // v1.1.6 改端口直转 + content 自行重组，字节绝不落地第三方存储。非静默模式完全不经此端口。
-  let sinkPort = null;
-  // 重组累积表：fileId -> { fileId, filename, cid, reqId, conflictAction, totalSize, chunks:[] }
-  const pendingFiles = new Map();
+  // 落盘说明（v1.1.8 起）：合并与落盘全部在 Offscreen 文档内闭环完成——
+  // offscreen 把字节构造成 Blob，经 blob: URL 调 chrome.downloads.download 直接写盘
+  // （字节零损耗、无大小限制，与 0.1.0 能播的可靠路径一致）。二进制不经过任何跨进程传递，
+  // 故不再需要 SW 中转 / sink 端口 / File System Access API / IndexedDB 等易损链路。
   // 任务已完成（bili-dl-done 已到）—— 之后到达的 bili-dl-progress 不再写 status/bar，
   // 避免 SW 中转的 chrome.tabs.query 并发回调乱序导致「done 之后又收到 phase=save 的
   // progress 把状态覆盖回『保存中』」。下一次 dispatchTask 调用时重置为 false。
@@ -240,10 +235,12 @@
     try { chrome.storage.local.set({ [DEDUP_KEY]: Array.from(downloadedCids) }); } catch (_) {}
   }
 
-  // ---------- 静默下载（File System Access API 直接写目录，不弹浏览器下载栏）----------
-  // 默认开启：首次下载时由用户手势授权一个目录（如“下载/BiliDL”），之后所有文件静默写入，
-  // 不再触发 Chrome 下载栏/逐文件弹窗（saveAs:false 仍会弹栏，只有 FS API 能彻底静默）。
-  // 不支持 FS API（如 Firefox）或用户拒绝授权时，自动回退到 chrome.downloads.download（仍会显示下载栏）。
+  // ---------- 落盘说明（v1.1.8 起）----------
+  // 合并后的字节在 Offscreen 文档内用 `new Blob([bytes])` → `URL.createObjectURL` →
+  // `chrome.downloads.download` 直接落盘：字节零损耗、无大小限制（blob: URL 不受 data:URL 的 MB 级上限约束）。
+  // 「静默下载」开关 = saveAs:false（不弹“另存为”，直接写入 Chrome 默认「下载」文件夹下的子目录，
+  // 子目录由面板输入框指定）；关闭静默 + 勾选「另存为」= saveAs:true（保存时弹系统对话框选任意真实文件夹）。
+  // 该方案为 0.1.0 已验证可播的可靠路径，彻底规避了历史上「端口 relay / IndexedDB 中转 / data:URL 截断」导致的损坏。
   const CONC_KEY = 'bili_dl_concurrency'; // 并发下载路数：1=单文件依次，≥2=多线程
   let fsDirHandle = null; // 已授权的目录句柄（内存缓存）
   function idbOpen() {
@@ -281,50 +278,15 @@
       tx.onerror = () => rej(tx.error);
     });
   }
-  // 在用户手势内（点下载按钮时）确保已拿到目录句柄；返回后 fsDirHandle 即用
-  async function prepareSilentHandle() {
-    if (!window.showDirectoryPicker) return; // 环境不支持 FS API → 走下载 API 兜底
-    if (fsDirHandle) {
-      try { if ((await fsDirHandle.requestPermission({ mode: 'readwrite' })) === 'granted') return; } catch (_) {}
-    }
-    const stored = await idbGet('dirHandle').catch(() => null);
-    if (stored) {
-      try {
-        if ((await stored.requestPermission({ mode: 'readwrite' })) === 'granted') { fsDirHandle = stored; return; }
-      } catch (_) {}
-    }
-    fsDirHandle = await window.showDirectoryPicker({ mode: 'readwrite' }); // 必须处在用户手势中
-    await idbSet('dirHandle', fsDirHandle).catch(() => {});
-  }
-  // 把字节写入磁盘：静默模式 + 句柄就绪 → FS API 直写（无下载栏）；否则回退下载 API
-  // 把字节写入磁盘：静默模式 + 句柄就绪 + 权限 granted → FS API 直写（无下载栏）；
-  //                  任一条件不满足 → 回退下载 API；两条路径都必须把成败显式报告，
-  //                  避免静默失败被吞导致用户看到「下载中…N/N 完成」但文件实际没保存。
+  // v1.1.8：落盘已在 Offscreen 内用 blob: URL 直接 chrome.downloads.download 完成，
+  // 不再需要 File System Access API 目录句柄（该路径曾在并发/重启下损坏文件）。
+  // 此函数保留为 no-op，避免改动各 start* 调用点；如需“任意真实文件夹”，
+  // 用户可在「另存为」勾选框中选择（届时 offscreen 用 saveAs:true）。
+  async function prepareSilentHandle() { /* no-op since v1.1.8 */ }
+  // v1.1.8：字节已由 Offscreen 经 blob: URL 直接落盘。此处的 writeFileSilent 仅作部分
+  // UI 流（如重试/导出）的兜底写盘路径，统一走 blob + chrome.downloads.download，
+  // 字节零损耗、无大小限制，不再触碰 File System Access API（该路径曾在并发/重启下损坏文件）。
   async function writeFileSilent(filename, uint8) {
-    const silent = getSilent();
-    // 静默路径：先校验权限（SW 重载或浏览器策略变化可能让 granted 失效），失败回退下载 API
-    if (silent && window.showDirectoryPicker && fsDirHandle) {
-      try {
-        const perm = await fsDirHandle.queryPermission({ mode: 'readwrite' });
-        if (perm !== 'granted') {
-          const req = await fsDirHandle.requestPermission({ mode: 'readwrite' });
-          if (req !== 'granted') throw new Error('目录权限被撤销');
-        }
-        const parts = String(filename).split('/').filter(Boolean);
-        const name = parts.pop();
-        let dir = fsDirHandle;
-        for (const p of parts) dir = await dir.getDirectoryHandle(p, { create: true });
-        const fh = await dir.getFileHandle(safeName(name), { create: true });
-        const w = await fh.createWritable();
-        await w.write(new Blob([uint8]));
-        await w.close();
-        return { ok: true, filename, silent: true };
-      } catch (e) {
-        // 静默写入失败：显式告诉用户，回退下载 API
-        const msg = '⚠️ 静默写入失败（' + filename + '）：' + (e && e.message || e) + '，回退下载 API';
-        console.warn('[bili-dl]', msg); setStatus(msg);
-      }
-    }
     const blob = new Blob([uint8]);
     const url = URL.createObjectURL(blob);
     try {
@@ -342,68 +304,11 @@
     const v = el ? parseInt(el.value, 10) : 3;
     return (v >= 1 && v <= 6) ? v : 3;
   }
-  // ---- 静默落盘 sink 端口处理（替代 v1.1.5 失效的 IndexedDB 中转）----
-  // content 经 bili-dl-sink 端口接收 SW 透传的字节流（init/chunk/final），在页面 origin 内重组后
-  // 走 File System Access API 直写目录。字节从不经 IndexedDB（origin 隔离会让 content 永远读不到）。
-  function ensureSink() {
-    if (sinkPort) return;
-    try {
-      sinkPort = chrome.runtime.connect({ name: 'bili-dl-sink' });
-      sinkPort.onMessage.addListener(onSinkMessage);
-      sinkPort.onDisconnect.addListener(() => { sinkPort = null; });
-    } catch (_) { sinkPort = null; }
-  }
-  function onSinkMessage(msg) {
-    if (!msg || typeof msg !== 'object') return;
-    if (msg.type === 'init') {
-      if (msg.reqId && msg.reqId !== currentReqId) return; // 仅处理当前批次
-      pendingFiles.set(msg.fileId, {
-        fileId: msg.fileId, filename: msg.filename,
-        cid: (typeof msg.cid === 'number') ? msg.cid : null,
-        reqId: msg.reqId, conflictAction: msg.conflictAction,
-        totalSize: msg.totalSize || 0, chunks: []
-      });
-    } else if (msg.type === 'chunk' && pendingFiles.has(msg.fileId)) {
-      // 单端口 FIFO 保证到达顺序 == 发送顺序；直接追加即可（index 仅作校验，未使用）
-      pendingFiles.get(msg.fileId).chunks.push(new Uint8Array(msg.buffer));
-    } else if (msg.type === 'final' && pendingFiles.has(msg.fileId)) {
-      const f = pendingFiles.get(msg.fileId);
-      pendingFiles.delete(msg.fileId);
-      assembleAndWrite(f).catch((e) => {
-        const err = '落盘重组失败：' + String((e && e.message) || e);
-        console.warn('[bili-dl]', err); setStatus('⚠️ ' + err);
-        batchFail++;
-        if (f.cid != null) { failErrors.set(f.cid, err); markRow(f.cid, 'fail'); }
-      });
-    }
-  }
-  async function assembleAndWrite(f) {
-    const total = f.totalSize || f.chunks.reduce((a, c) => a + c.length, 0);
-    const out = new Uint8Array(total);
-    let pos = 0;
-    for (const c of f.chunks) { out.set(c, pos); pos += c.length; }
-    const r = await writeFileSilent(f.filename, out);
-    // 回传结果给 SW（SW 再转达 offscreen，以 resolve 其 saveBlob Promise）
-    try {
-      chrome.runtime.sendMessage({
-        type: 'bili-dl-written', fileId: f.fileId,
-        ok: !!(r && r.ok), filename: f.filename,
-        error: (r && r.error) || '落盘失败'
-      });
-    } catch (_) {}
-    if (r && r.ok) {
-      batchDone++;
-      if (f.cid != null) markRow(f.cid, 'ok');
-      tryLocalDone();
-    } else {
-      batchFail++;
-      const err = (r && r.error) || '落盘失败';
-      if (f.cid != null) { failErrors.set(f.cid, err); markRow(f.cid, 'fail'); }
-      tryLocalDone();
-    }
-  }
+  // v1.1.8：落盘已在 Offscreen 内用 blob: URL 直接 chrome.downloads.download 完成，
+  // 不再经 sink 端口 / File System Access API / IndexedDB 中转（这些链路曾在并发或 SW 重启下
+  // 损坏文件）。以下 biliStatus 调试函数保留，仅用于查看批量状态。
 
-  // 调试：console 运行 window.biliStatus() 查看 fsDirHandle / batch 状态
+  // 调试：console 运行 window.biliStatus() 查看 batch 状态
   window.biliStatus = function () {
     return {
       hasFsDirHandle: !!fsDirHandle,
@@ -522,14 +427,13 @@
     completedIdx.clear(); batchDone = 0; batchFail = 0;
     try { await ensureOffscreen(); }
     catch (e) { setStatus('创建 offscreen 失败：' + (e.message || e)); return; }
-    // 静默落盘：开 sink 端口并注册本批次 reqId，使 SW 能把字节流转发给 content 在页面内 FS 直写
-    ensureSink();
-    if (sinkPort) { try { sinkPort.postMessage({ type: 'register', reqId: currentReqId }); } catch (_) {} }
+    // v1.1.8：落盘由 Offscreen 内 blob: URL 直接完成，无需在 content 开 sink 端口。
     chrome.runtime.sendMessage({
       type: 'bili-dl-task', reqId: currentReqId, jobs,
       nameFormat: nameFormat || getNameFormat(),
       dir: (typeof dir === 'string') ? dir : getDir(),
-      saveAs: (typeof saveAs === 'boolean') ? saveAs : getSaveAs(),
+      // 静默模式（默认勾选）= 不弹“另存为”对话框（saveAs:false）；关闭静默后由“另存为”勾选框决定
+      saveAs: (typeof saveAs === 'boolean') ? saveAs : (getSilent() ? false : getSaveAs()),
       conflictAction: (typeof conflictAction === 'string') ? conflictAction : getConflictAction(),
       concurrency: (typeof concurrency === 'number') ? concurrency : getConcurrency(),
       silent: getSilent()
@@ -950,7 +854,7 @@
               <div class="fmt-preview" id="bili-dl-fmt-preview"></div>
             </div>
             <div class="bili-dl-dir">
-              <div class="dir-title">Chrome 扩展只能存到“下载”目录下的子文件夹；勾选下方开关可弹系统对话框选任意真实文件夹</div>
+              <div class="dir-title">文件保存到 Chrome 默认「下载」文件夹下的子目录；勾选「另存为」可在保存时弹窗选任意真实文件夹</div>
               <div class="dir-row">
                 <span class="dir-prefix">下载目录/</span>
                 <input type="text" id="bili-dl-dir" placeholder="例如 Bilibili/Videos" spellcheck="false" autocomplete="off">
@@ -964,8 +868,8 @@
               <label class="extra-chk"><input type="checkbox" id="bili-dl-aux-dm"> 弹幕</label>
               <label class="extra-chk"><input type="checkbox" id="bili-dl-aux-cover"> 封面</label>
               <label class="extra-chk" style="width:100%"><input type="checkbox" id="bili-dl-silent" checked> 静默下载（推荐·不走浏览器下载栏，直接写目录）</label>
-              <button type="button" id="bili-dl-change-dir" class="bili-dl-changedir">📁 更改下载目录</button>
-              <div id="bili-dl-dir-label" class="bili-dl-dir-label">未选择目录（首次下载会弹出选择）</div>
+              <button type="button" id="bili-dl-change-dir" class="bili-dl-changedir">🗑️ 清空子目录</button>
+              <div id="bili-dl-dir-label" class="bili-dl-dir-label">下载位置：下载目录/（根目录）</div>
               <div class="bili-dl-conflict">
                 <span>并发下载</span>
                 <select id="bili-dl-conc">
@@ -1058,42 +962,23 @@
     silentCb.onchange = saveSilent;
     concSel.onchange = saveSilent;
 
-    // 静默下载目录：更改按钮 + 当前目录名显示
-    // 关键：fsDirHandle 在每次 content 重新注入时内存为空，需从 IndexedDB 恢复目录名显示；
-    // 「更改目录」必须在用户手势（click）内调用 showDirectoryPicker，并同步清空内存缓存 + 重写 IndexedDB。
+    // 下载落盘位置说明（v1.1.8 起）：「静默下载」= saveAs:false，文件由 offscreen 内 Blob 直接写入
+    // Chrome 默认「下载」文件夹下的子目录（子目录 = 下方输入框，留空即根目录）；「另存为」开关 = saveAs:true，
+    // 保存时弹系统对话框可选任意真实文件夹。Chrome 扩展在 offscreen 内无法调用 showDirectoryPicker 自定根目录，
+    // 故采用 0.1.0 已验证可播的方案：offscreen 内 Blob → chrome.downloads.download，字节零损耗、无大小限制。
     const changeDirBtn = document.getElementById('bili-dl-change-dir');
     const dirLabel = document.getElementById('bili-dl-dir-label');
     function refreshDirLabel() {
-      if (fsDirHandle && fsDirHandle.name) {
-        dirLabel.innerHTML = '当前目录：<b>' + String(fsDirHandle.name).replace(/</g, '&lt;') + '</b>';
-      } else {
-        dirLabel.textContent = '未选择目录（首次下载会弹出选择）';
-      }
+      const d = (document.getElementById('bili-dl-dir') || {}).value || '';
+      const sub = d.trim() ? d.trim().replace(/\/+$/, '') + '/' : '';
+      dirLabel.innerHTML = '下载位置：下载目录/' + (sub ? '<b>' + String(sub).replace(/</g, '&lt;') + '</b>' : '<b>（根目录）</b>');
     }
-    changeDirBtn.onclick = async () => {
-      if (!window.showDirectoryPicker) {
-        setStatus('⚠️ 当前浏览器不支持「文件系统访问 API」（如 Firefox），无法选目录。请关闭「静默下载」改走浏览器下载栏。');
-        return;
-      }
-      try {
-        const h = await window.showDirectoryPicker({ mode: 'readwrite' });
-        fsDirHandle = h; // 清空旧句柄，确保后续落盘用新目录
-        await idbSet('dirHandle', h).catch(() => {});
-        refreshDirLabel();
-        setStatus('✅ 下载目录已更改为：' + h.name);
-      } catch (e) {
-        if (e && e.name === 'AbortError') return; // 用户在弹窗里点了「取消」→ 不动声色
-        setStatus('⚠️ 选择目录失败：' + (e && e.message ? e.message : e));
-      }
+    if (dirInput) dirInput.addEventListener('input', refreshDirLabel);
+    changeDirBtn.onclick = () => {
+      if (dirInput) { dirInput.value = ''; refreshDirLabel(); }
+      setStatus('已清空子目录，文件将保存到 Chrome 默认「下载」文件夹根目录。');
     };
-    // 面板打开时异步从 IndexedDB 恢复已保存的目录名（不触发权限弹窗）
-    (async () => {
-      try {
-        const stored = await idbGet('dirHandle').catch(() => null);
-        if (stored && stored.name) { fsDirHandle = stored; refreshDirLabel(); }
-        else refreshDirLabel();
-      } catch (_) { refreshDirLabel(); }
-    })();
+    refreshDirLabel();
 
     // 设置栏（统一收纳：仅下载音频 / 文件名格式 / 下载位置 / 测试 ffmpeg）：默认折叠，展开状态持久化
     const SETTINGS_OPEN_KEY = 'bili_dl_settings_open';
@@ -1579,15 +1464,9 @@
       return segs.length ? segs.join('_') : 'bili-dl';
     }
     async function directDownload(url, filename) {
-      if (getSilent() && window.showDirectoryPicker && fsDirHandle) {
-        try { const buf = await (await fetch(url)).arrayBuffer(); await writeFileSilent(filename, new Uint8Array(buf)); return; } catch (_) {}
-      }
       await chrome.downloads.download({ url, filename, saveAs: false, conflictAction: getConflictAction() });
     }
     async function directDownloadText(text, filename, mime) {
-      if (getSilent() && window.showDirectoryPicker && fsDirHandle) {
-        try { await writeFileSilent(filename, new TextEncoder().encode(text)); return; } catch (_) {}
-      }
       const b64 = btoa(unescape(encodeURIComponent(text)));
       await chrome.downloads.download({ url: `data:${mime || 'application/octet-stream'};base64,${b64}`, filename, saveAs: false, conflictAction: getConflictAction() });
     }

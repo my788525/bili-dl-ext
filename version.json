@@ -1,6 +1,3 @@
 {
-  "version": "1.1.7",
-  "release_url": "https://github.com/my788525/bili-dl-ext/releases/latest",
-  "min_chrome": "110",
-  "notes": "修复「下载的视频在 Windows 无法播放」的根因：原 ffmpeg-core 误打包为多线程(@ffmpeg/core)构建，依赖 ffmpeg-core.worker.js + SharedArrayBuffer(COOP/COEP)，而扩展无法提供，导致 ffmpeg worker 初始化失败、合并只产出约 48 字节空文件。已替换为单线程构建 @ffmpeg/core-st@0.11.0，纯主线程 ccall 驱动，合并产出完整的 H.264+AAC 通用 MP4（Windows 默认播放器可播）。此 bug 存在于所有 git 版本（含 v1.0.0），故只有最早用单线程 core 的原型能播。同时保留 v1.1.6 的静默模式端口直转链路。"
+  "version": "1.1.8"
 }

@@ -130,53 +130,39 @@ async function fetchToUint8(url, onProgress) {
   return out;
 }
 
+// ---- 落盘：在 Offscreen 文档内直接 chrome.downloads.download（0.1.0 已验证可播的可靠路径）----
+// 关键：用 `new Blob([uint8])` 字节构造 Blob，再由 URL.createObjectURL 得到 blob: URL 传给
+// chrome.downloads.download。blob: URL **无大小限制**，字节零损耗、绝不截断——这是与
+// 「offscreen→SW 端口→data:URL(base64) 下载」方案的根本区别：data:URL 在 Chrome 下载中有
+// 硬上限(约 2–32MB)，大视频会被静默截断成损坏文件、Windows 默认播放器打不开。
+// chrome.downloads API 在 Offscreen Document 上下文是可用的（0.1.0 直接用它写盘、实测稳定），
+// 所以整条流水线（取流→合并→落盘）都在 offscreen 内闭环完成，二进制不经过任何跨进程传递。
 async function saveBlob(uint8, filename, saveAs, conflictAction, reqId, silent, cid) {
-  const CHUNK = 8 * 1024 * 1024; // 8MB/块（transferable ArrayBuffer，单次发送远低于扩展消息体积上限）
-  const totalSize = uint8.length;
-  const fileId = 'f' + Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
-  return new Promise((resolve, reject) => {
-    let port;
-    try { port = chrome.runtime.connect({ name: 'bili-dl-save' }); }
-    catch (e) { reject(new Error('无法连接落盘通道：' + String(e.message || e))); return; }
-    let finished = false;
-    port.onMessage.addListener((m) => {
-      if (m.type === 'ready') {
-        let offset = 0, index = 0;
-        const sendNext = () => {
-          if (offset >= totalSize) {
-            try { port.postMessage({ type: 'final', fileId }); } catch (_) {}
-            return;
-          }
-          const slice = uint8.subarray(offset, Math.min(offset + CHUNK, totalSize));
-          const standalone = slice.slice(); // 独立 buffer 才能 transferable
-          try { port.postMessage({ type: 'chunk', index, buffer: standalone.buffer }, [standalone.buffer]); }
-          catch (e) { if (!finished) { finished = true; port.disconnect(); reject(new Error('分块发送失败：' + String(e.message || e))); } return; }
-          offset += CHUNK; index++;
-          if (offset < totalSize) setTimeout(sendNext, 0);
-          else sendNext();
-        };
-        sendNext();
-      } else if (m.type === 'done') {
-        finished = true; port.disconnect();
-        resolve({ filename: m.filename, fallback: m.fallback });
-      } else if (m.type === 'error') {
-        finished = true; port.disconnect();
-        reject(new Error(m.error || '落盘失败'));
-      }
+  const blob = new Blob([uint8], { type: 'application/octet-stream' });
+  const url = URL.createObjectURL(blob);
+  try {
+    await chrome.downloads.download({
+      url,
+      filename,
+      saveAs: !!saveAs,                       // 静默模式 = saveAs:false（不弹“另存为”）
+      conflictAction: (conflictAction === 'overwrite' || conflictAction === 'prompt' || conflictAction === 'uniquify')
+        ? conflictAction : 'uniquify'
     });
-    port.onDisconnect.addListener(() => {
-      if (!finished) reject(new Error('落盘通道已断开（SW 可能未启动或被 Chrome 重启）'));
-    });
+    return { filename, fallback: false };
+  } catch (e) {
+    // 极少数 Chrome 场景不支持 blob: 下载，退回 offscreen 文档内 a[download] 触发
     try {
-      port.postMessage({
-        type: 'init', fileId,
-        filename, saveAs: !!saveAs,
-        conflictAction: conflictAction || 'uniquify',
-        silent: !!silent,
-        totalSize, reqId: reqId || null, cid: (typeof cid === 'number') ? cid : null
-      });
-    } catch (e) { if (!finished) { finished = true; port.disconnect(); reject(new Error('启动落盘通道失败：' + String(e.message || e))); } }
-  });
+      const a = document.createElement('a');
+      a.href = url; a.download = filename;
+      document.body.appendChild(a); a.click(); a.remove();
+      await new Promise(r => setTimeout(r, 400));
+      return { filename, fallback: true };
+    } catch (e2) {
+      throw new Error('落盘失败：' + String((e && e.message) || e) + ' / ' + String((e2 && e2.message) || e2));
+    }
+  } finally {
+    setTimeout(() => { try { URL.revokeObjectURL(url); } catch (_) {} }, 60000);
+  }
 }
 
 // ---- 下载子目录清洗（防御式：Chrome 仅允许“下载”目录下的相对路径）----
