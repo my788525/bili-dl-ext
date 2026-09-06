@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Bilibili 视频下载器",
-  "version": "1.1.9",
+  "version": "1.1.10",
   "description": "在 B 站视频页注入下载按钮，调用取流接口下载并合并 DASH 音视频；内置 ffmpeg 本地合并，离线可用。支持多P批量、自定义文件名、行内进度、浮动按钮拖动记忆与版本检测。",
   "minimum_chrome_version": "110",
   "homepage_url": "https://github.com/my788525/bili-dl-ext",

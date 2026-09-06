@@ -846,7 +846,7 @@
               </select>
             </div>
             <div class="bili-dl-fmt">
-              <div class="fmt-title">文件名格式 · 勾选组合（PN/选集名称仅多P合集生效）</div>
+              <div class="fmt-title">文件名格式 · 勾选组合（单P默认仅「视频标题」；多P自动切换为「标题+PN+选集名+清晰度」命名模式，可手动改）</div>
               <label><input type="checkbox" id="bili-dl-fmt-title" checked> 视频标题</label>
               <label><input type="checkbox" id="bili-dl-fmt-pn" checked> PN（分P序号）</label>
               <label><input type="checkbox" id="bili-dl-fmt-part" checked> 选集名称</label>
@@ -933,6 +933,16 @@
     [fmtTitle, fmtPn, fmtPart, fmtQn].forEach(cb => {
       cb.onchange = () => { saveFmt(); if (ctx && !batchRunning) renderList(); updateFmtPreview(); };
     });
+    // 按单P/多P 自动套用命名默认：单P→仅「视频标题」；多P→四字段全开（标题+PN+选集名+清晰度）。
+    // 仅当视频切换（bvid 变化）时触发，避免覆盖用户在当前视频内的手动调整。
+    function applyDefaultFmtForType(isMulti) {
+      fmtTitle.checked = true;
+      fmtPn.checked = isMulti;
+      fmtPart.checked = isMulti;
+      fmtQn.checked = isMulti;
+      saveFmt();
+      updateFmtPreview();
+    }
 
     // 下载位置持久化：子目录（是否弹系统“另存为”对话框由“静默下载”开关决定，见 dispatchTask）
     const saveDir = () => chrome.storage.local.set({ [DIR_KEY]: dirInput.value.trim() });
@@ -1123,7 +1133,11 @@
         const cls = classifyStreams(data);
         if (cls.type === 'none') throw new Error('该视频无可下载的流（可能需登录，或会员专享/受限）。');
         const pages = st.pages && st.pages.length ? st.pages : [{ cid: st.cid, page: 1, part: '' }];
+        const prevBvid = (ctx && ctx.bvid) || null;
+        const isMulti = pages.length > 1;
         ctx = { title: st.title, bvid: st.bvid, cls, pages, selected: new Set(pages.map(p => p.cid)), pic: st.pic || null };
+        // 视频切换（bvid 变化）时，按单P/多P 自动套用命名默认：单P→纯标题，多P→多P命名模式
+        if (st.bvid !== prevBvid) applyDefaultFmtForType(isMulti);
         renderList();
         updateFmtPreview();
         status.textContent = audonly.checked ? '点击下载音频' : '选择清晰度开始下载';
