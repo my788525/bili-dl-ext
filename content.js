@@ -348,10 +348,19 @@
 
   function setStatus(text) { if (ui.status) ui.status.textContent = text; }
   function setBar(pct) { if (ui.bar) ui.bar.style.width = Math.max(0, Math.min(100, Math.round(pct))) + '%'; }
+  function fmtSpeed(bps) {
+    if (!bps || bps <= 0) return '';
+    if (bps >= 1024 * 1024) return (bps / 1024 / 1024).toFixed(1) + ' MB/s';
+    if (bps >= 1024) return (bps / 1024).toFixed(0) + ' KB/s';
+    return bps.toFixed(0) + ' B/s';
+  }
 
   // 文件名格式 & 下载位置 的持久化键
-  const FMT_KEY = 'bili_dl_namefmt';
+  // 单P / 多P 各自独立记忆格式勾选，避免「看一个单P视频把多P的勾选也冲掉」
+  const FMT_KEY_SINGLE = 'bili_dl_namefmt_single';
+  const FMT_KEY_MULTI = 'bili_dl_namefmt_multi';
   const DIR_KEY = 'bili_dl_dir';
+  const fmtKeyFor = (isMulti) => (isMulti ? FMT_KEY_MULTI : FMT_KEY_SINGLE);
   // 静默下载（默认开启）：开启时走 File System Access API 直接写目录，不弹浏览器下载栏
   const SILENT_KEY = 'bili_dl_silent';
 
@@ -421,9 +430,11 @@
     // 构建批量元数据：jobIndex -> cid/label，供进度消息定位到具体分P行
     currentBatchMeta = {
       reqId: currentReqId,
-      byIndex: jobs.map(j => ({ cid: (j && typeof j.cid === 'number') ? j.cid : null, label: (j && j._label) || '' }))
+      byIndex: jobs.map(j => ({ cid: (j && typeof j.cid === 'number') ? j.cid : null, label: (j && j._label) || '' })),
+      progress: {} // jobIndex -> 0..1，用于中央进度条聚合
     };
     completedIdx.clear(); batchDone = 0; batchFail = 0;
+    setBar(0); // 任务开始即把中央进度条归零，过程中实时推进，结束置 100%
     try { await ensureOffscreen(); }
     catch (e) { setStatus('创建 offscreen 失败：' + (e.message || e)); return; }
     // v1.1.8：落盘由 Offscreen 内 blob: URL 直接完成，无需在 content 开 sink 端口。
@@ -487,10 +498,27 @@
       ? `下载中… 已完成 ${batchDone + batchFail}/${total}`
       : '全选 / 全不选';
   }
+  // 聚合所有 job 的进度写入中央进度条；单视频（无分行）也靠这条拿到实时反馈
+  function updateAggregateProgress() {
+    if (!currentBatchMeta) return;
+    const prog = currentBatchMeta.progress || {};
+    const total = currentBatchMeta.byIndex.length;
+    if (!total) return;
+    let sum = 0;
+    for (let i = 0; i < total; i++) sum += (typeof prog[i] === 'number' ? prog[i] : 0);
+    setBar(Math.round((sum / total) * 100));
+  }
   function onBatchProgress(msg) {
     if (!currentBatchMeta || msg.reqId !== currentBatchMeta.reqId) return;
     const meta = currentBatchMeta.byIndex[msg.jobIndex];
     if (!meta) return;
+    // 记录该 job 的进度（聚合到中央进度条）
+    const p = (msg.progress || 0);
+    if (msg.phase === 'done' || msg.phase === 'error' || (msg.phase === 'fetch' && p >= 1)) {
+      currentBatchMeta.progress[msg.jobIndex] = 1;
+    } else if (msg.phase === 'fetch' || msg.phase === 'transcode') {
+      currentBatchMeta.progress[msg.jobIndex] = p;
+    }
     if (msg.phase === 'done') {
       // 【本地真相源】fetch 100% 与 done 通常都到达；以 Set 幂等防止重复计数。
       // markRow 写 is-ok → 整行变深绿实色 + 白色 ✓；不再依赖任何集中状态栏。
@@ -507,6 +535,11 @@
       // 进行中：更新该分P 行的进度覆盖层宽度；其他行完全不受影响
       if (meta.cid != null) markRow(meta.cid, 'running', msg.progress);
     }
+    // 中央进度条 + 状态文案实时推进（下载中/合并中 + 百分比 + 速度），单视频也可见
+    updateAggregateProgress();
+    const phaseTxt = msg.phase === 'transcode' ? '合并中' : (msg.phase === 'fetch' ? '下载中' : '处理中');
+    const spd = fmtSpeed(msg.speed);
+    setStatus(`${phaseTxt} ${Math.round((currentBatchMeta.progress[msg.jobIndex] || 0) * 100)}%` + (spd ? ` · ${spd}` : ''));
     updateBatchHeader();
     // 【本地真相源】当本批所有 jobs 都已通过 progress 标记为完成（含成功与失败）时，
     // 立即主动复位 UI + 写完成文案 + Toast——即便 done 消息被 SW 中转链丢失，UI 也不会卡住。
@@ -846,11 +879,11 @@
               </select>
             </div>
             <div class="bili-dl-fmt">
-              <div class="fmt-title">文件名格式 · 勾选组合（单P默认仅「视频标题」；多P自动切换为「标题+PN+选集名+清晰度」命名模式，可手动改）</div>
+              <div class="fmt-title">文件名格式 · 勾选组合（单P默认仅「视频标题」；多P自动套用该类型上次勾选的命名模式；可手动改）</div>
               <label><input type="checkbox" id="bili-dl-fmt-title" checked> 视频标题</label>
-              <label><input type="checkbox" id="bili-dl-fmt-pn" checked> PN（分P序号）</label>
-              <label><input type="checkbox" id="bili-dl-fmt-part" checked> 选集名称</label>
-              <label><input type="checkbox" id="bili-dl-fmt-qn" checked> 清晰度</label>
+              <label><input type="checkbox" id="bili-dl-fmt-pn"> PN（分P序号）</label>
+              <label><input type="checkbox" id="bili-dl-fmt-part"> 选集名称</label>
+              <label><input type="checkbox" id="bili-dl-fmt-qn"> 清晰度</label>
               <div class="fmt-preview" id="bili-dl-fmt-preview"></div>
             </div>
             <div class="bili-dl-dir">
@@ -917,31 +950,39 @@
     const fmtPart = $('#bili-dl-fmt-part'), fmtQn = $('#bili-dl-fmt-qn');
     const dirInput = $('#bili-dl-dir'), dirNote = $('#bili-dl-dir-note');
 
-    // 文件名格式持久化：跨页面/刷新保留勾选
+    // 文件名格式持久化：单P / 多P 各自独立记忆勾选（避免互相覆盖）
+    let activeIsMulti = false; // 当前视频是否为多P（决定存到哪个键）
     const saveFmt = () => chrome.storage.local.set({
-      [FMT_KEY]: { title: fmtTitle.checked, pn: fmtPn.checked, part: fmtPart.checked, qn: fmtQn.checked }
-    });
-    chrome.storage.local.get(FMT_KEY, (s) => {
-      const saved = (s && s[FMT_KEY]) || null;
-      if (saved) {
-        fmtTitle.checked = saved.title !== false;
-        fmtPn.checked = saved.pn !== false;
-        fmtPart.checked = saved.part !== false;
-        fmtQn.checked = saved.qn !== false;
-      }
+      [fmtKeyFor(activeIsMulti)]: { title: fmtTitle.checked, pn: fmtPn.checked, part: fmtPart.checked, qn: fmtQn.checked }
     });
     [fmtTitle, fmtPn, fmtPart, fmtQn].forEach(cb => {
       cb.onchange = () => { saveFmt(); if (ctx && !batchRunning) renderList(); updateFmtPreview(); };
     });
-    // 按单P/多P 自动套用命名默认：单P→仅「视频标题」；多P→四字段全开（标题+PN+选集名+清晰度）。
+    // 按单P/多P 自动套用命名默认：
+    //  · 单P → 仅「视频标题」（用户要求：单P 文件名默认=视频标题）
+    //  · 多P → 沿用该类型上次手动勾选的存储；无存储时默认「标题+PN+选集名」（不默认勾清晰度，避免「默认直接勾4个」）
     // 仅当视频切换（bvid 变化）时触发，避免覆盖用户在当前视频内的手动调整。
     function applyDefaultFmtForType(isMulti) {
-      fmtTitle.checked = true;
-      fmtPn.checked = isMulti;
-      fmtPart.checked = isMulti;
-      fmtQn.checked = isMulti;
-      saveFmt();
-      updateFmtPreview();
+      activeIsMulti = isMulti;
+      const key = fmtKeyFor(isMulti);
+      chrome.storage.local.get(key, (s) => {
+        const saved = (s && s[key]) || null;
+        let f;
+        if (saved) {
+          f = { title: saved.title !== false, pn: saved.pn === true, part: saved.part === true, qn: saved.qn === true };
+        } else {
+          // 无存储时的类型默认：单P 仅标题；多P 标题+PN+选集名（不含清晰度）
+          f = isMulti
+            ? { title: true, pn: true, part: true, qn: false }
+            : { title: true, pn: false, part: false, qn: false };
+        }
+        fmtTitle.checked = f.title;
+        fmtPn.checked = f.pn;
+        fmtPart.checked = f.part;
+        fmtQn.checked = f.qn;
+        saveFmt();
+        updateFmtPreview();
+      });
     }
 
     // 下载位置持久化：子目录（是否弹系统“另存为”对话框由“静默下载”开关决定，见 dispatchTask）
