@@ -1162,31 +1162,19 @@
     // 独立测试 ffmpeg 本地 wasm 管线（不依赖 B 站接口，经 offscreen 运行）
     selftestBtn.onclick = () => { runSelfTest(); };
 
-    // 清洗视频标题中的站品牌噪音，避免文件名出现 bilibili_ 前缀 / _哔哩哔哩_bilibili 尾缀。
-    // 某些页面 document.title 或接口返回的标题会带上这些品牌字样，直接去掉更干净。
-    function cleanTitle(s) {
-      if (!s) return s;
-      let t = String(s).trim();
-      t = t.replace(/^bilibili[_：:\s\-]*/i, '');                 // 去前缀 bilibili_ / Bilibili-
-      t = t.replace(/\s*[-_]\s*(哔哩哔哩|bilibili)\s*$/i, '');   // 去尾缀 - bilibili / _哔哩哔哩
-      t = t.replace(/\s*哔哩哔哩\s*$/, '');
-      t = t.replace(/[\s_\-]+$/, '');                            // 去掉品牌字被剥掉后残留的尾随分隔符
-      return t.trim();
-    }
-
     async function loadQualities() {
       status.textContent = '正在解析视频信息…'; bar.style.width = '0%'; list.innerHTML = '';
       try {
         const st = await getState();
         if (!st.bvid || !st.cid) throw new Error('未能从页面读取 bvid/cid，请确认在视频播放页。');
-        vtitle.textContent = cleanTitle(st.title);
+        vtitle.textContent = st.title;
         const data = await getPlayUrl(st.bvid, st.cid, 120);
         const cls = classifyStreams(data);
         if (cls.type === 'none') throw new Error('该视频无可下载的流（可能需登录，或会员专享/受限）。');
         const pages = st.pages && st.pages.length ? st.pages : [{ cid: st.cid, page: 1, part: '' }];
         const prevBvid = (ctx && ctx.bvid) || null;
         const isMulti = pages.length > 1;
-        ctx = { title: cleanTitle(st.title), bvid: st.bvid, cls, pages, selected: new Set(pages.map(p => p.cid)), pic: st.pic || null };
+        ctx = { title: st.title, bvid: st.bvid, cls, pages, selected: new Set(pages.map(p => p.cid)), pic: st.pic || null };
         // 视频切换（bvid 变化）时，按单P/多P 自动套用命名默认：单P→纯标题，多P→多P命名模式
         if (st.bvid !== prevBvid) applyDefaultFmtForType(isMulti);
         renderList();

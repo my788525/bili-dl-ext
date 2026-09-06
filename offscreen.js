@@ -178,7 +178,9 @@ function sanitizeDir(d) {
     .replace(/^\/+|\/+$/g, '')         // 去掉首尾斜杠
     .slice(0, 80);
 }
-// 把子目录前缀拼到基础文件名前；dir 为空则返回原文件名
+// 把子目录作为真实相对路径前缀拼到基础文件名前（Chrome 会在“下载”目录下创建该子文件夹）；
+// dir 为空则返回原文件名。注意：必须用路径分隔符 '/'，绝不能用 '_' 把子目录名拼进文件名，
+// 否则会出现「bilibili_xxxxx.mp4 落在根目录」而非「bilibili/xxxxx.mp4 落在子文件夹」的问题。
 function withDir(baseName, dir) {
   const d = sanitizeDir(dir);
   return d ? (d + '/' + baseName) : baseName;
@@ -190,17 +192,6 @@ function safeName(s) {
     .replace(/\s+/g, ' ')
     .trim()
     .slice(0, 80) || 'bilibili';
-}
-
-// 去文件名里的站品牌噪音：前缀 bilibili_ / Bilibili- 与尾缀 _哔哩哔哩_bilibili（某些页面标题会带）
-function cleanTitle(s) {
-  if (!s) return s;
-  let t = String(s).trim();
-  t = t.replace(/^bilibili[_：:\s\-]*/i, '');
-  t = t.replace(/\s*[-_]\s*(哔哩哔哩|bilibili)\s*$/i, '');
-  t = t.replace(/\s*哔哩哔哩\s*$/, '');
-  t = t.replace(/[\s_\-]+$/, '');
-  return t.trim();
 }
 
 function cleanupFS(core) {
@@ -215,7 +206,7 @@ function cleanupFS(core) {
 // 单 P 视频无 PN / 选集名称概念（job.page=0 且 job.part=''），对应开关自动不生效。
 function buildFileName(job, nf) {
   const segs = [];
-  if (nf.title && job.title) segs.push(safeName(cleanTitle(job.title)));
+  if (nf.title && job.title) segs.push(safeName(job.title));
   if (nf.pn && job.page) segs.push('P' + String(job.page).padStart(2, '0'));
   if (nf.part && job.part) segs.push(safeName(job.part));
   if (nf.qn && job.qn) segs.push(String(job.qn) + 'p');
