@@ -597,11 +597,9 @@
     chrome.runtime.onMessage.addListener((msg) => {
       if (!msg || typeof msg !== 'object') return;
       if (msg.type === 'bili-dl-progress' && msg.reqId === currentReqId) {
-        // 中央状态栏不再实时刷新——各分P 进度完全由各自行内 .row-bg 推进；
-        // 中央进度条仅在所有分P 完成时一次性置 100%（在 tryLocalDone 内调用）。
-        // 这样避免了「下载中（X/Y） X%」长期显示 + 卡在「99%」等待 done 的问题：
-        // 用户看到的反馈就是各分P 行内色块横向填充，单行完成立即变深绿 + ✓，
-        // 全部完成时才闪一次底部状态条 + Toast。
+        // 进度消息由 background SW 经继电器转发给本 content（也可经 runtime.sendMessage 直达，
+        // 两者均为幂等；v1.1.8 精简 SW 后曾丢失转发，导致进度从不到达、中央条始终停在初始状态）。
+        // onBatchProgress 内会同时驱动「逐行 .row-bg 填充」与「中央进度条 + 状态文案」实时推进。
         onBatchProgress(msg);
       } else if (msg.type === 'bili-dl-done' && msg.reqId === currentReqId) {
         // 【本地真相源】tryLocalDone() 可能已先行触发（按 progress 自动复位）。
@@ -795,7 +793,7 @@
         /* 多P行状态：运行中/成功/失败 视觉反馈 —— 行内覆盖式进度条 + 深绿实色完成态 */
         .bili-dl-row { position: relative; overflow: hidden; transition: border-color .15s; }
         /* 行内进度覆盖层：绝对定位铺底，width 由 JS 0–100% 控制 */
-        .bili-dl-row .row-bg { position: absolute; left: 0; top: 0; bottom: 0; width: 0%; background: rgba(46,204,113,0.22); z-index: 0; pointer-events: none; transition: width .18s ease-out; }
+        .bili-dl-row .row-bg { position: absolute; left: 0; top: 0; bottom: 0; width: 0%; background: rgba(251,114,153,0.30); z-index: 0; pointer-events: none; transition: width .18s ease-out; }
         /* 行内容全部浮在 .row-bg 之上（z:1） */
         .bili-dl-row > * { position: relative; z-index: 1; }
         /* 多 P 列表容器：固定范围滚动，避免长列表顶出下载按钮 */

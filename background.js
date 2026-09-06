@@ -5,8 +5,10 @@
  * 落盘与 ffmpeg 合并/转码全部在 Offscreen Document 内闭环完成（见 offscreen.js）：
  *   offscreen 把合并好的字节用 new Blob → blob: URL → chrome.downloads.download 直接写盘，
  *   blob: URL 无大小限制、字节零损耗（这正是 0.1.0「能播」的关键；data:URL 有大小上限会截断损坏）。
- * 进度/完成消息由 offscreen 经 chrome.runtime.sendMessage 广播，content script 的
- * chrome.runtime.onMessage 监听器直接收到（与 0.1.0 一致，已实测可送达），无需 SW 中转。
+ * 进度/完成消息由 offscreen 经 chrome.runtime.sendMessage 发到本 SW，再由 SW 用
+ * chrome.tabs.sendMessage 转发给发起任务的 content 标签页（见下方 reqTab 继电器）。
+ * 注：offscreen 的 runtime.sendMessage 仅直达 SW（不直达 content），故必须经 SW 中转才到 content；
+ * content 侧处理器均幂等，重复投递无害。
  */
 
 const MIXIN_KEY_ENC_TAB = [46,47,18,2,53,8,23,32,15,50,10,31,58,3,45,35,27,43,5,49,33,9,42,19,29,28,14,39,12,38,41,13,37,48,7,16,24,55,40,61,26,17,0,1,60,51,30,4,22,25,54,21,56,59,6,63,57,62,11,36,20,34,44,52];
@@ -130,7 +132,25 @@ chrome.runtime.onInstalled.addListener(async () => {
   try { await ensureOffscreen(); } catch (e) { console.warn('[bili-dl] offscreen 创建失败', e); }
 });
 
+// ---- 进度/完成消息转发：offscreen 的 chrome.runtime.sendMessage 先抵达本 SW，
+// 再由 SW 用 chrome.tabs.sendMessage 显式转发给发起任务的 content 标签页。
+// （双保险：若 runtime.sendMessage 也直达 content，content 侧处理器均为幂等，重复投递无害。）
+const reqTab = {}; // reqId -> tabId
+function relayToTab(reqId, msg) {
+  const tabId = reqTab[reqId];
+  if (typeof tabId !== 'number') return;
+  try { chrome.tabs.sendMessage(tabId, msg); } catch (_) {}
+}
+
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
+  if (msg.type === 'bili-dl-task') {
+    // 记录发起任务的 content 标签页，供后续进度/完成消息精准转发
+    if (sender && sender.tab && typeof sender.tab.id === 'number') reqTab[msg.reqId] = sender.tab.id;
+  }
+  if (msg.type === 'bili-dl-progress' || msg.type === 'bili-dl-done' ||
+      msg.type === 'bili-dl-error' || msg.type === 'bili-dl-selftest-result') {
+    relayToTab(msg.reqId, msg); // 转发给 content（幂等，重复投递无害）
+  }
   if (msg.type === 'read-initial-state') {
     // content 无 chrome.tabs/scripting 权限，由 SW 代为在 MAIN world 读页面 __INITIAL_STATE__
     const tabId = sender.tab && sender.tab.id;
