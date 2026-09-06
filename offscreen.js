@@ -192,6 +192,17 @@ function safeName(s) {
     .slice(0, 80) || 'bilibili';
 }
 
+// 去文件名里的站品牌噪音：前缀 bilibili_ / Bilibili- 与尾缀 _哔哩哔哩_bilibili（某些页面标题会带）
+function cleanTitle(s) {
+  if (!s) return s;
+  let t = String(s).trim();
+  t = t.replace(/^bilibili[_：:\s\-]*/i, '');
+  t = t.replace(/\s*[-_]\s*(哔哩哔哩|bilibili)\s*$/i, '');
+  t = t.replace(/\s*哔哩哔哩\s*$/, '');
+  t = t.replace(/[\s_\-]+$/, '');
+  return t.trim();
+}
+
 function cleanupFS(core) {
   for (const f of ['v.m4s', 'a.m4s', 'out.mp4', 'out.m4a', 'out.mp3', 'in.bin']) {
     try { core.FS.unlink(f); } catch (_) {}
@@ -204,7 +215,7 @@ function cleanupFS(core) {
 // 单 P 视频无 PN / 选集名称概念（job.page=0 且 job.part=''），对应开关自动不生效。
 function buildFileName(job, nf) {
   const segs = [];
-  if (nf.title && job.title) segs.push(safeName(job.title));
+  if (nf.title && job.title) segs.push(safeName(cleanTitle(job.title)));
   if (nf.pn && job.page) segs.push('P' + String(job.page).padStart(2, '0'));
   if (nf.part && job.part) segs.push(safeName(job.part));
   if (nf.qn && job.qn) segs.push(String(job.qn) + 'p');
