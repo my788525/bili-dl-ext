@@ -186,13 +186,20 @@
   let ui = { status: null, bar: null };
   let currentReqId = null;
   let listenerReady = false;
-  // 分块落盘累积表：fileId -> { meta, chunks:Map<index,Uint8Array>, totalSize }
-  // offscreen 把合并好的字节按 8MB 切块经 SW 中转回 content，content 在此重组后静默直写，
-  // 避免「整包字节一次性 sendMessage」超出扩展消息体积上限导致大视频落盘失败。
+  // 静默落盘 sink 端口：content 在 dispatchTask 时开 chrome.runtime.connect('bili-dl-sink')
+  // 并向 SW 注册 reqId；SW 把静默文件的字节流（init/chunk/final）透传至本端口，
+  // content 在「页面 origin」内重组并走 File System Access API 直写目录（不弹下载栏）。
+  // 关键：IndexedDB 按 origin 隔离，SW（chrome-extension://）与 content（bilibili.com）无法共享，
+  // 故 v1.1.5 的 IndexedDB 中转方案失效（content 永远读不到字节 → 报「未取得文件字节」）；
+  // v1.1.6 改端口直转 + content 自行重组，字节绝不落地第三方存储。非静默模式完全不经此端口。
+  let sinkPort = null;
+  // 重组累积表：fileId -> { fileId, filename, cid, reqId, conflictAction, totalSize, chunks:[] }
+  const pendingFiles = new Map();
   // 任务已完成（bili-dl-done 已到）—— 之后到达的 bili-dl-progress 不再写 status/bar，
   // 避免 SW 中转的 chrome.tabs.query 并发回调乱序导致「done 之后又收到 phase=save 的
   // progress 把状态覆盖回『保存中』」。下一次 dispatchTask 调用时重置为 false。
   let doneReceived = false;
+  let localDoneFired = false; // 防止 tryLocalDone 在同一批次内被进度/落盘两路重复触发（避免重复 Toast）
 
   // 批量下载的实时状态（供进度消息更新分P行与顶部计数）
   let rowEls = new Map();          // cid -> { row, mark, cb }（多P列表行的稳定引用）
@@ -335,32 +342,64 @@
     const v = el ? parseInt(el.value, 10) : 3;
     return (v >= 1 && v <= 6) ? v : 3;
   }
-  // 接收 offscreen 经 SW 中转回的分块字节，按 fileId 重组后落盘
-  // 接收 SW 经 IndexedDB 中转的落盘指令：从 IndexedDB 取出字节后落盘
-  // （静默模式走 File System Access 直写目录，否则回退 chrome.downloads.download）。
-  // 字节由 SW 直接写入 IndexedDB，content 只负责「取出→写入」，不经过任何分块重组，
-  // 因此不再有 v1.1.x「分块经 SW relay 到 content 丢块→错位损坏」的问题。
-  async function handleSilentWrite(msg) {
-    const fname = msg.filename;
-    const cid = (msg && typeof msg.cid !== 'undefined') ? msg.cid : null;
-    const bytes = await idbGet('bili-save-' + msg.fileId).catch(() => null);
-    await idbDelete('bili-save-' + msg.fileId).catch(() => {});
-    if (!bytes) {
-      const err = '未取得文件字节（IndexedDB 中转失败）：' + fname;
-      console.warn('[bili-dl]', err); setStatus('⚠️ ' + err);
-      batchFail++;
-      if (cid != null) { failErrors.set(cid, err); markRow(cid, 'fail'); }
-      return;
+  // ---- 静默落盘 sink 端口处理（替代 v1.1.5 失效的 IndexedDB 中转）----
+  // content 经 bili-dl-sink 端口接收 SW 透传的字节流（init/chunk/final），在页面 origin 内重组后
+  // 走 File System Access API 直写目录。字节从不经 IndexedDB（origin 隔离会让 content 永远读不到）。
+  function ensureSink() {
+    if (sinkPort) return;
+    try {
+      sinkPort = chrome.runtime.connect({ name: 'bili-dl-sink' });
+      sinkPort.onMessage.addListener(onSinkMessage);
+      sinkPort.onDisconnect.addListener(() => { sinkPort = null; });
+    } catch (_) { sinkPort = null; }
+  }
+  function onSinkMessage(msg) {
+    if (!msg || typeof msg !== 'object') return;
+    if (msg.type === 'init') {
+      if (msg.reqId && msg.reqId !== currentReqId) return; // 仅处理当前批次
+      pendingFiles.set(msg.fileId, {
+        fileId: msg.fileId, filename: msg.filename,
+        cid: (typeof msg.cid === 'number') ? msg.cid : null,
+        reqId: msg.reqId, conflictAction: msg.conflictAction,
+        totalSize: msg.totalSize || 0, chunks: []
+      });
+    } else if (msg.type === 'chunk' && pendingFiles.has(msg.fileId)) {
+      // 单端口 FIFO 保证到达顺序 == 发送顺序；直接追加即可（index 仅作校验，未使用）
+      pendingFiles.get(msg.fileId).chunks.push(new Uint8Array(msg.buffer));
+    } else if (msg.type === 'final' && pendingFiles.has(msg.fileId)) {
+      const f = pendingFiles.get(msg.fileId);
+      pendingFiles.delete(msg.fileId);
+      assembleAndWrite(f).catch((e) => {
+        const err = '落盘重组失败：' + String((e && e.message) || e);
+        console.warn('[bili-dl]', err); setStatus('⚠️ ' + err);
+        batchFail++;
+        if (f.cid != null) { failErrors.set(f.cid, err); markRow(f.cid, 'fail'); }
+      });
     }
-    const r = await writeFileSilent(fname, (bytes instanceof Uint8Array) ? bytes : new Uint8Array(bytes));
+  }
+  async function assembleAndWrite(f) {
+    const total = f.totalSize || f.chunks.reduce((a, c) => a + c.length, 0);
+    const out = new Uint8Array(total);
+    let pos = 0;
+    for (const c of f.chunks) { out.set(c, pos); pos += c.length; }
+    const r = await writeFileSilent(f.filename, out);
+    // 回传结果给 SW（SW 再转达 offscreen，以 resolve 其 saveBlob Promise）
+    try {
+      chrome.runtime.sendMessage({
+        type: 'bili-dl-written', fileId: f.fileId,
+        ok: !!(r && r.ok), filename: f.filename,
+        error: (r && r.error) || '落盘失败'
+      });
+    } catch (_) {}
     if (r && r.ok) {
       batchDone++;
-      if (cid != null) markRow(cid, 'ok');
+      if (f.cid != null) markRow(f.cid, 'ok');
       tryLocalDone();
     } else {
       batchFail++;
       const err = (r && r.error) || '落盘失败';
-      if (cid != null) { failErrors.set(cid, err); markRow(cid, 'fail'); }
+      if (f.cid != null) { failErrors.set(f.cid, err); markRow(f.cid, 'fail'); }
+      tryLocalDone();
     }
   }
 
@@ -474,6 +513,7 @@
     if (!jobs || !jobs.length) { setStatus('没有可下载的流'); return; }
     currentReqId = 'r' + Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
     doneReceived = false; // 新一轮：清空 done 守卫
+    localDoneFired = false; // 重置本地完成守卫，允许本批触发一次
     // 构建批量元数据：jobIndex -> cid/label，供进度消息定位到具体分P行
     currentBatchMeta = {
       reqId: currentReqId,
@@ -482,6 +522,9 @@
     completedIdx.clear(); batchDone = 0; batchFail = 0;
     try { await ensureOffscreen(); }
     catch (e) { setStatus('创建 offscreen 失败：' + (e.message || e)); return; }
+    // 静默落盘：开 sink 端口并注册本批次 reqId，使 SW 能把字节流转发给 content 在页面内 FS 直写
+    ensureSink();
+    if (sinkPort) { try { sinkPort.postMessage({ type: 'register', reqId: currentReqId }); } catch (_) {} }
     chrome.runtime.sendMessage({
       type: 'bili-dl-task', reqId: currentReqId, jobs,
       nameFormat: nameFormat || getNameFormat(),
@@ -571,6 +614,8 @@
   // 本地真相源触发条件：每个分P 进度达到 100%（或出错）即视为完成
   // —— 此时 content 立即复位按钮与状态栏，不依赖 bili-dl-done 消息
   function tryLocalDone() {
+    if (localDoneFired) return;      // 同批次只触发一次，避免进度/落盘两路重复写状态与 Toast
+    localDoneFired = true;
     if (!currentBatchMeta) return;
     const total = currentBatchMeta.byIndex.length;
     const okCount = batchDone;
@@ -621,10 +666,6 @@
         // 用户看到的反馈就是各分P 行内色块横向填充，单行完成立即变深绿 + ✓，
         // 全部完成时才闪一次底部状态条 + Toast。
         onBatchProgress(msg);
-      } else if (msg.type === 'bili-dl-write' && msg.reqId === currentReqId) {
-        // SW 已把合并好的字节写入 IndexedDB 中转；content 取出后落盘：
-        // 静默模式走 File System Access API 直接写目录（无下载栏），否则回退下载 API。
-        handleSilentWrite(msg).catch(e => console.warn('[bili-dl] 落盘接收失败', e));
       } else if (msg.type === 'bili-dl-done' && msg.reqId === currentReqId) {
         // 【本地真相源】tryLocalDone() 可能已先行触发（按 progress 自动复位）。
         // 如果已经触发过，done 仅用作 success/fallback 统计补全，不重复写文案。

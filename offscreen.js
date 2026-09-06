@@ -9,8 +9,9 @@
  *     仅在 window 上下文（content/popup）可用、SW 内也不可用。因此 offscreen 合并完每个文件后，
  *     开一条 chrome.runtime.connect('bili-dl-save') 长连接，把字节用 transferable ArrayBuffer
  *     直接发回 SW（不经过 content 重组，绝不会因多跳中转丢块）。SW 收齐后：默认直接
- *     chrome.downloads.download（字节绝对精确）；静默模式把字节写入 IndexedDB 中转给 content
- *     走 File System Access 直写目录（不弹下载栏）。
+ *     chrome.downloads.download（字节绝对精确）；静默模式由 SW 把字节流转发给 content 的
+ *     bili-dl-sink 端口，content 在页面 origin 内重组并走 File System Access 直写目录
+ *     （不弹下载栏）。IndexedDB 因 origin 隔离无法跨 SW/Content 共享，故不采用。
  *  3. ffmpeg-core 用 @ffmpeg/core@0.11.0 的 Emscripten 工厂（顶部 var createFFmpegCore
  *     已挂全局）。本扩展不设 COOP/COEP -> SharedArrayBuffer 不可用 -> Emscripten 自动
  *     回退单线程，不派生 Worker，故 CSP 无需放行 blob Worker。

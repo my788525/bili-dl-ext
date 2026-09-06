@@ -1,6 +1,6 @@
 {
-  "version": "1.1.5",
+  "version": "1.1.6",
   "release_url": "https://github.com/my788525/bili-dl-ext/releases/latest",
   "min_chrome": "110",
-  "notes": "修复「能保存但打不开 / Windows 默认播放器无法播放」——根因是 v1.1.x 把合并好的字节用分块消息 relay 回 content 重组，在批量/并发或 SW 重启时丢块导致文件错位损坏。本版彻底回退到 v1.0.0 的可靠落盘链路：offscreen 合并后开长连接(chrome.runtime.connect)把字节用 transferable ArrayBuffer 分块直接发给 SW（字节从不过 content 重组），SW 收齐后——非静默直接 chrome.downloads.download；静默模式写入 IndexedDB 中转给 content 走 File System Access 直写。文件字节 100% 精确，输出仍是通用 H.264+AAC MP4。同时保留 1.1.4 的「优先选 AVC 源 + copy 封装、必要时才转码」逻辑，绝大多数下载秒级且可播。"
+  "notes": "修复静默模式「未取得文件字节（IndexedDB 中转失败）」。根因：IndexedDB 按 origin 隔离——Service Worker 写入的是 chrome-extension:// 扩展 origin，而 content script 读取的是 bilibili.com 页面 origin，两者是不同数据库，content 永远读不到字节。本版彻底弃用 IndexedDB 中转，改为 SW 端口直转：content 在 dispatchTask 时开 bili-dl-sink 端口并向 SW 注册 reqId，SW 把静默文件的字节流(init/chunk/final)透传给 content，由 content 在页面 origin 内重组并走 File System Access API 直写目录（不弹下载栏）。非静默模式不受影响，仍由 SW 直接 chrome.downloads.download。无任何第三方存储中转，字节绝不丢块。"
 }
