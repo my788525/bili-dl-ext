@@ -1,6 +1,6 @@
 {
-  "version": "1.1.1",
+  "version": "1.1.2",
   "release_url": "https://github.com/my788525/bili-dl-ext/releases/latest",
   "min_chrome": "110",
-  "notes": "修复静默下载「大视频无法保存」：落盘链路由「整包字节一次性 sendMessage」改为「8MB 分块流式传回 content 重组后再静默直写」，规避扩展消息体积上限；无 bilibili 标签页时仍由 SW 用下载 API 兜底。对齐 manifest.json 版本号（此前 version.json 与 manifest 不一致会导致版本检测误报）。"
+  "notes": "修复静默下载「下载中 N/N 全部 ❌ 但文件没保存」三大问题：(1) offscreen 端把 8MB 分块改为火与忘（fire-and-forget）发送，不再 await SW 回执导致的 1 分钟超时死锁；(2) content 端落盘前显式调用 queryPermission/requestPermission，SW 重载或策略变化导致的权限失效会被重新激活；(3) 写盘失败（静默与下载 API 全部失败）会通过 setStatus/batchFail/Toast 显式上报而非被静默吞掉。新增调试接口 biliStatus（console 内运行）。SW 中转改为真正火与忘给 content，去除 swAccumSaves/relayToBiliTabs 旧死代码。"
 }

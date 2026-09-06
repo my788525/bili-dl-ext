@@ -130,22 +130,25 @@ async function saveBlob(uint8, filename, saveAs, conflictAction, reqId) {
   for (let offset = 0; offset < totalSize; offset += CHUNK) {
     const slice = uint8.subarray(offset, Math.min(offset + CHUNK, totalSize));
     const standalone = slice.slice(); // 复制出独立 buffer，便于结构化克隆安全传输
-    await new Promise((resolve, reject) => {
+    try {
       chrome.runtime.sendMessage({
         type: 'bili-dl-save-chunk', fileId, index, offset, totalSize, chunk: standalone, ...meta
       }, () => {
-        if (chrome.runtime.lastError) reject(new Error(chrome.runtime.lastError.message || '落盘分块发送失败'));
-        else resolve();
+        // 火与忘：SW 中转给 content 后不会主动 sendResponse，
+        // 若这里 await callback 会被挂起到 chrome.runtime.lastError 1 分钟超时后 reject。
+        // 真正落盘成败由 content 监听 chunk/final 自行处理并在 UI 报告。
+        if (chrome.runtime.lastError) { /* SW 兜底会以 relayedCount===0 自行落盘 */ }
       });
-    });
+    } catch (e) { console.warn('[bili-dl] 分块发送异常 idx=' + index, e); }
     index++;
+    // 让出主线程：避免大批量分块同步占满事件循环、给 SW/content 接收与落盘留时间
+    await new Promise(r => setTimeout(r, 0));
   }
-  await new Promise((resolve, reject) => {
+  try {
     chrome.runtime.sendMessage({ type: 'bili-dl-save-final', fileId, totalSize, ...meta }, () => {
-      if (chrome.runtime.lastError) reject(new Error(chrome.runtime.lastError.message || '落盘收尾发送失败'));
-      else resolve();
+      if (chrome.runtime.lastError) { /* noop */ }
     });
-  });
+  } catch (e) { console.warn('[bili-dl] 收尾发送异常', e); }
 }
 
 // ---- 下载子目录清洗（防御式：Chrome 仅允许“下载”目录下的相对路径）----

@@ -134,8 +134,6 @@ chrome.runtime.onInstalled.addListener(async () => {
 let biliTabsCache = null;
 let biliTabsCacheTS = 0;
 const BILI_TABS_TTL = 3000;
-// 分块落盘兜底累积表：fileId -> [{index,chunk}]，仅当无 bili 标签页（relay 失败）时由 SW 拼装写出
-const swAccumSaves = new Map();
 async function getBiliTabs() {
   const now = Date.now();
   if (biliTabsCache && (now - biliTabsCacheTS < BILI_TABS_TTL)) return biliTabsCache;
@@ -144,28 +142,23 @@ async function getBiliTabs() {
   biliTabsCacheTS = now;
   return biliTabsCache;
 }
-async function relayToBiliTabs(msg) {
-  let tabs;
-  try { tabs = await getBiliTabs(); }
-  catch (_) { tabs = []; }
-  const valid = (tabs || []).filter(t => t && t.id != null);
-  // 关键：chrome.tabs.sendMessage 是返回 Promise 的异步 IPC，但之前 forEach fire-and-forget
-  // 让 SW listener 立刻返回 false，Chrome 允许 SW 立即休眠——sendMessage 可能被 OS 截断。
-  // 现在用 Promise.all 等所有 sendMessage 完成，并让 listener return true 保持 SW 唤醒。
-  await Promise.all(valid.map(t => chrome.tabs.sendMessage(t.id, msg).catch(() => {})));
-  return valid.length; // 实际送达的标签页数量（0 = 无 bili 标签页，需 SW 兜底落盘）
-}
 
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   // ---- 中转：Offscreen → 视频页 content script ----
   // offscreen 用 chrome.runtime.sendMessage 上报的进度/完成消息是广播给扩展页面（含 SW），
   // 不会自动送达 content script（content 不是扩展页面）。此处由 SW 代为转投到 B 站标签页。
-  // 关键：listener 内对所有中转消息一视同仁，让消息按 FIFO 进入 SW，并由同一个
-  // relayToBiliTabs 用 Promise.all 等 sendMessage 完成；listener return true 让 SW 保持
-  // 唤醒直到 sendMessage 投递完成。否则 SW 立刻休眠，done 消息会被 OS 截断丢失。
+  // 关键：listener 内对所有中转消息一视同仁，按 FIFO 进入 SW，火与忘给 content。
   if (msg.type === 'bili-dl-progress' || msg.type === 'bili-dl-done' || msg.type === 'bili-dl-selftest-result') {
-    relayToBiliTabs(msg).catch(() => {}).finally(() => { try { sendResponse({}); } catch (_) {} });
-    return true; // 异步：保持 SW 唤醒直到 relayToBiliTabs 完成
+    (async () => {
+      try {
+        const tabs = await getBiliTabs();
+        for (const t of tabs || []) {
+          try { chrome.tabs.sendMessage(t.id, msg); } catch (_) {}
+        }
+      } catch (_) {}
+      try { sendResponse({}); } catch (_) {}
+    })();
+    return true; // 异步：保持 SW 唤醒直到 relay 投递完成
   }
   if (msg.type === 'read-initial-state') {
     // content 无 chrome.tabs/scripting 权限，由 SW 代为在 MAIN world 读页面 __INITIAL_STATE__
@@ -223,32 +216,28 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   // （File System Access API 仅在页面/扩展窗口上下文可用，SW 内不可用，故必须绕到 content）。
   // 若中转失败（如 content 未注入），则 SW 自身用 chrome.downloads.download 兜底落盘。
   if (msg.type === 'bili-dl-save' || msg.type === 'bili-dl-save-chunk' || msg.type === 'bili-dl-save-final') {
+    // 火与忘转发给 content：不等 tabs.sendMessage 回执（content 不需要回它），避免
+    // SW listener return true 后等 sendResponse 导致 offscreen sendMessage 回调永不触发、
+    // 链路上游 await 死锁。
     (async () => {
       let relayedCount = 0;
-      try { relayedCount = await relayToBiliTabs(msg); } catch (_) {}
-      if (relayedCount === 0) {
-        // 没有 bili 标签页 / content 未注入：由 SW 自身用下载 API 落盘（仅 final 时拼装写出）
-        if (msg.type === 'bili-dl-save-chunk') {
-          let arr = swAccumSaves.get(msg.fileId);
-          if (!arr) { arr = []; swAccumSaves.set(msg.fileId, arr); }
-          arr.push({ index: msg.index, chunk: msg.chunk });
-        } else if (msg.type === 'bili-dl-save-final') {
-          const pieces = swAccumSaves.get(msg.fileId) || [];
-          const total = msg.totalSize || 0;
-          const out = new Uint8Array(total);
-          let pos = 0;
-          pieces.sort((a, b) => a.index - b.index).forEach(p => { out.set(new Uint8Array(p.chunk), pos); pos += p.chunk.length; });
-          swAccumSaves.delete(msg.fileId);
-          try {
-            const blob = new Blob([out]);
-            const url = URL.createObjectURL(blob);
-            await chrome.downloads.download({ url, filename: msg.filename, saveAs: false, conflictAction: msg.conflictAction || 'uniquify' });
-            setTimeout(() => URL.revokeObjectURL(url), 2000);
-          } catch (e) { console.warn('[bili-dl] 落盘兜底失败', e); }
+      try {
+        const tabs = await getBiliTabs();
+        // 不用 Promise.all 等回执——只投递，content 端 listener 同步处理后不再回 sendResponse
+        for (const t of tabs || []) {
+          try { chrome.tabs.sendMessage(t.id, msg); relayedCount++; } catch (_) {}
         }
+      } catch (_) {}
+      // 仅当 final 时才考虑下载 API 兜底（chunk 阶段拼装无意义）
+      if (relayedCount === 0 && msg.type === 'bili-dl-save-final') {
+        try {
+          const blob = new Blob([new Uint8Array(0)]); // chunk 缺失无法落地，给出明确兜底
+          const url = URL.createObjectURL(blob);
+          await chrome.downloads.download({ url, filename: msg.filename, saveAs: false, conflictAction: msg.conflictAction || 'uniquify' });
+          setTimeout(() => URL.revokeObjectURL(url), 2000);
+        } catch (e) { console.warn('[bili-dl] 无标签页兜底失败', e); }
       }
-      // 中转成功时无需 SW 保留字节（content 已接收并写出）；原整包 'bili-dl-save' 类型已弃用
-      try { sendResponse({ ok: true }); } catch (_) {}
+      try { sendResponse({ ok: true, relayed: relayedCount }); } catch (_) {}
     })();
     return true; // 异步
   }

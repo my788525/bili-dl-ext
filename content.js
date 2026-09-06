@@ -282,10 +282,19 @@
     await idbSet('dirHandle', fsDirHandle).catch(() => {});
   }
   // 把字节写入磁盘：静默模式 + 句柄就绪 → FS API 直写（无下载栏）；否则回退下载 API
+  // 把字节写入磁盘：静默模式 + 句柄就绪 + 权限 granted → FS API 直写（无下载栏）；
+  //                  任一条件不满足 → 回退下载 API；两条路径都必须把成败显式报告，
+  //                  避免静默失败被吞导致用户看到「下载中…N/N 完成」但文件实际没保存。
   async function writeFileSilent(filename, uint8) {
     const silent = getSilent();
+    // 静默路径：先校验权限（SW 重载或浏览器策略变化可能让 granted 失效），失败回退下载 API
     if (silent && window.showDirectoryPicker && fsDirHandle) {
       try {
+        const perm = await fsDirHandle.queryPermission({ mode: 'readwrite' });
+        if (perm !== 'granted') {
+          const req = await fsDirHandle.requestPermission({ mode: 'readwrite' });
+          if (req !== 'granted') throw new Error('目录权限被撤销');
+        }
         const parts = String(filename).split('/').filter(Boolean);
         const name = parts.pop();
         let dir = fsDirHandle;
@@ -295,13 +304,21 @@
         await w.write(new Blob([uint8]));
         await w.close();
         return { ok: true, filename, silent: true };
-      } catch (_) { /* 落到下载 API 兜底 */ }
+      } catch (e) {
+        // 静默写入失败：显式告诉用户，回退下载 API
+        const msg = '⚠️ 静默写入失败（' + filename + '）：' + (e && e.message || e) + '，回退下载 API';
+        console.warn('[bili-dl]', msg); setStatus(msg);
+      }
     }
     const blob = new Blob([uint8]);
     const url = URL.createObjectURL(blob);
     try {
       await chrome.downloads.download({ url, filename, saveAs: false, conflictAction: getConflictAction() });
-      return { ok: true, filename };
+      return { ok: true, filename, silent: false };
+    } catch (e) {
+      const msg = '❌ 落盘完全失败（' + filename + '）：' + (e && e.message || e);
+      console.error('[bili-dl]', msg); setStatus(msg);
+      return { ok: false, filename, error: e && e.message || String(e) };
     } finally { setTimeout(() => URL.revokeObjectURL(url), 1500); }
   }
   function getSilent() { const el = document.getElementById('bili-dl-silent'); return el ? el.checked : true; }
@@ -324,17 +341,54 @@
       entry.chunks.set(msg.index, new Uint8Array(msg.chunk));
       return;
     }
-    // bili-dl-save-final：拼装全部分块后落盘
+    // bili-dl-save-final：拼装全部分块后落盘，并把结果显式上报（成功/失败都报）
     const total = entry.totalSize || 0;
     const out = new Uint8Array(total);
     let pos = 0;
+    let miss = 0;
     Array.from(entry.chunks.keys()).sort((a, b) => a - b).forEach(i => {
       const c = entry.chunks.get(i);
+      if (!c) { miss++; return; }
       out.set(c, pos); pos += c.length;
     });
     pendingWrites.delete(fid);
-    await writeFileSilent(entry.meta.filename, out);
+    const fname = entry.meta.filename;
+    const finalCid = entry.meta && entry.meta.cid;
+    if (miss > 0) {
+      console.warn('[bili-dl] ' + fname + ' 缺 ' + miss + ' 块，已尽力写出');
+      setStatus('⚠️ ' + fname + ' 缺 ' + miss + ' 块，文件可能不完整');
+    }
+    const r = await writeFileSilent(fname, out);
+    if (!r || !r.ok) {
+      batchFail++;
+      if (finalCid != null) {
+        failErrors.set(finalCid, (r && r.error) || '落盘失败');
+        markRow(finalCid, 'fail');
+      }
+    } else {
+      batchDone++;
+      if (finalCid != null) markRow(finalCid, 'ok');
+      tryLocalDone();
+    }
   }
+
+  // 调试：console 运行 window.biliStatus() 查看 fsDirHandle / pendingWrites / batch 状态
+  window.biliStatus = function () {
+    const pending = [];
+    pendingWrites.forEach((v, k) => pending.push({ fileId: k, received: v.chunks.size, totalSize: v.totalSize, filename: v.meta.filename }));
+    return {
+      hasFsDirHandle: !!fsDirHandle,
+      fsApiSupported: !!window.showDirectoryPicker,
+      silentSetting: getSilent && getSilent(),
+      concurrency: getConcurrency(),
+      currentReqId,
+      pendingWritesCount: pendingWrites.size,
+      pendingWrites: pending,
+      batchRunning,
+      batchDone,
+      batchFail
+    };
+  };
 
   // 字幕 JSON -> ASS 文本转换（B站字幕为内部 JSON 格式，转成通用 ASS 便于播放器加载）
   function assTime(sec) {
